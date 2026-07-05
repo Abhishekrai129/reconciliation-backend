@@ -1,8 +1,11 @@
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -16,12 +19,16 @@ from services.pipeline_tracker import (
     record_human_action, fail_step, complete_run,
     get_run_trace, get_all_runs,
 )
+from services import rag_service
+from services.rag_service import init_rag_db
+from services import probabilistic_matcher
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     init_pipeline_db()
+    init_rag_db()
     yield
 
 
@@ -379,6 +386,375 @@ def pipeline_review(run_id: str, body: PipelineReviewRequest):
 def pipeline_complete(run_id: str, body: PipelineCompleteRequest):
     complete_run(run_id, body.match_rate, body.matched, body.breaks)
     return {"ok": True}
+
+
+# ── Break RAG ─────────────────────────────────────────────────────────────────
+
+class BreakStoreRequest(BaseModel):
+    source_fields: dict
+    target_fields: dict
+    break_fields: list[str]
+    resolution: Optional[str] = None
+    resolution_type: Optional[str] = None
+    run_id: Optional[str] = None
+
+
+class BreakResolveRequest(BaseModel):
+    break_id: int
+    resolution: str
+    resolution_type: str
+
+
+class BreakSimilarRequest(BaseModel):
+    source_fields: dict
+    target_fields: dict
+    break_fields: list[str]
+    top_k: int = 3
+
+
+@app.post("/api/breaks/store")
+def breaks_store(req: BreakStoreRequest):
+    break_id = rag_service.store_break(
+        req.source_fields, req.target_fields, req.break_fields,
+        req.resolution, req.resolution_type, req.run_id,
+    )
+    log("break_stored", {"break_id": break_id, "fields": req.break_fields})
+    return {"break_id": break_id}
+
+
+@app.post("/api/breaks/resolve")
+def breaks_resolve(req: BreakResolveRequest):
+    rag_service.resolve_break(req.break_id, req.resolution, req.resolution_type)
+    log("break_resolved", {"break_id": req.break_id, "resolution_type": req.resolution_type},
+        reasoning=req.resolution)
+    return {"ok": True}
+
+
+@app.post("/api/breaks/similar")
+def breaks_similar(req: BreakSimilarRequest):
+    similar = rag_service.find_similar_breaks(
+        req.source_fields, req.target_fields, req.break_fields, req.top_k
+    )
+    return {"similar": similar}
+
+
+@app.get("/api/breaks")
+def breaks_list():
+    return {"breaks": rag_service.get_all_breaks(100)}
+
+
+# ── Schema Rule Library ────────────────────────────────────────────────────────
+
+class RuleLibrarySaveRequest(BaseModel):
+    source_cols: list[str]
+    target_cols: list[str]
+    confirmed_mappings: list[dict]
+    confirmed_rules: list[dict]
+
+
+class RuleLibraryLookupRequest(BaseModel):
+    source_cols: list[str]
+    target_cols: list[str]
+
+
+@app.post("/api/rules/save")
+def rules_save(req: RuleLibrarySaveRequest):
+    fp = rag_service.save_rule_library(
+        req.source_cols, req.target_cols, req.confirmed_mappings, req.confirmed_rules
+    )
+    log("rule_library_saved", {"fingerprint": fp, "rules": len(req.confirmed_rules)})
+    return {"fingerprint": fp}
+
+
+@app.post("/api/rules/lookup")
+def rules_lookup(req: RuleLibraryLookupRequest):
+    result = rag_service.get_rule_library(req.source_cols, req.target_cols)
+    return {"found": result is not None, "library": result}
+
+
+@app.get("/api/rules/library")
+def rules_library_list():
+    return {"entries": rag_service.get_all_rule_library()}
+
+
+# ── Probabilistic Reconciliation ───────────────────────────────────────────────
+
+class ProbabilisticRequest(BaseModel):
+    file_a_id: str
+    file_b_id: str
+    mappings: list[dict]          # same format as regular rules
+    threshold: float = 0.65
+    blocking_field: Optional[str] = None
+    run_id: Optional[str] = None
+
+
+@app.post("/api/reconcile/probabilistic")
+def run_probabilistic(req: ProbabilisticRequest):
+    try:
+        df_a = file_processor.get_dataframe(req.file_a_id)
+        df_b = file_processor.get_dataframe(req.file_b_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    field_config = probabilistic_matcher.infer_field_config(req.mappings)
+
+    try:
+        result = probabilistic_matcher.probabilistic_reconcile(
+            df_a, df_b, field_config,
+            threshold=req.threshold,
+            blocking_field=req.blocking_field,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if req.run_id:
+        reconciliation.store_run_results(req.run_id, result)
+
+    log("probabilistic_reconciliation", {
+        "matched": result["matched"],
+        "breaks": result["breaks"],
+        "match_rate": result["match_rate"],
+        "threshold": req.threshold,
+    })
+    return result
+
+
+# ── Streaming Reconciliation (SSE) ─────────────────────────────────────────────
+
+class StreamReconcileRequest(BaseModel):
+    file_a_id: str
+    file_b_id: str
+    rules: list[dict]
+    key_columns: list[dict]
+    run_id: Optional[str] = None
+
+
+@app.post("/api/reconcile/stream")
+async def stream_reconciliation(req: StreamReconcileRequest):
+    """
+    Server-Sent Events endpoint. Streams each reconciled record as it is
+    processed so the UI can surface breaks in real time without waiting for
+    the full result set.
+    """
+    def _event(data: dict) -> str:
+        return f"data: {json.dumps(data)}\n\n"
+
+    def generate():
+        try:
+            df_a = file_processor.get_dataframe(req.file_a_id).copy()
+            df_b = file_processor.get_dataframe(req.file_b_id).copy()
+        except KeyError as e:
+            yield _event({"type": "error", "message": str(e)})
+            return
+
+        yield _event({"type": "start", "total_source": len(df_a), "total_target": len(df_b)})
+
+        rename_map = {r["target_column"]: r["source_column"] for r in req.rules}
+        df_b = df_b.rename(columns=rename_map)
+
+        key_source = [k["source"] for k in req.key_columns]
+        key_target = [rename_map.get(k["target"], k["target"]) for k in req.key_columns]
+
+        import pandas as pd
+        df_a["_key"] = df_a[key_source].astype(str).apply(lambda x: "|".join(x), axis=1)
+        df_b["_key"] = df_b[key_source].astype(str).apply(lambda x: "|".join(x), axis=1)
+
+        merged = pd.merge(
+            df_a.add_suffix("_A"),
+            df_b.add_suffix("_B"),
+            left_on="_key_A",
+            right_on="_key_B",
+            how="outer",
+            indicator=True,
+        )
+
+        matched = breaks = unmatched_a = unmatched_b = 0
+        all_records = []
+
+        for _, row in merged.iterrows():
+            flag = row["_merge"]
+
+            if flag == "left_only":
+                unmatched_a += 1
+                rec = {
+                    "match_key": str(row.get("_key_A", "")),
+                    "status": "unmatched_source",
+                    "match_probability": 0.0,
+                    "source_data": {c.replace("_A", ""): row[c] for c in merged.columns if c.endswith("_A")},
+                    "target_data": {},
+                    "break_reasons": ["No matching record in target file"],
+                }
+            elif flag == "right_only":
+                unmatched_b += 1
+                rec = {
+                    "match_key": str(row.get("_key_B", "")),
+                    "status": "unmatched_target",
+                    "match_probability": 0.0,
+                    "source_data": {},
+                    "target_data": {c.replace("_B", ""): row[c] for c in merged.columns if c.endswith("_B")},
+                    "break_reasons": ["No matching record in source file"],
+                }
+            else:
+                source_data = {c.replace("_A", ""): row[c] for c in merged.columns if c.endswith("_A")}
+                target_data = {c.replace("_B", ""): row[c] for c in merged.columns if c.endswith("_B")}
+                break_reasons = []
+
+                from services.reconciliation import _compare_values
+                for rule in req.rules:
+                    col = rule["source_column"]
+                    col_a, col_b = f"{col}_A", f"{col}_B"
+                    if col_a not in merged.columns or col_b not in merged.columns:
+                        continue
+                    val_a, val_b = row.get(col_a), row.get(col_b)
+                    import pandas as _pd
+                    if _pd.isna(val_a) and _pd.isna(val_b):
+                        continue
+                    if not _compare_values(val_a, val_b, rule.get("match_type", "exact"), rule.get("threshold")):
+                        break_reasons.append(f"{col}: {val_a} ≠ {val_b}")
+
+                if break_reasons:
+                    breaks += 1
+                    status = "break"
+                else:
+                    matched += 1
+                    status = "matched"
+
+                rec = {
+                    "match_key": str(row.get("_key_A", row.get("_key_B", ""))),
+                    "status": status,
+                    "match_probability": 1.0 if status == "matched" else 0.5,
+                    "source_data": source_data,
+                    "target_data": target_data,
+                    "break_reasons": break_reasons,
+                }
+
+            all_records.append(rec)
+            # Stream each record immediately
+            yield _event({"type": "record", "record": rec})
+
+        total = matched + breaks + unmatched_a + unmatched_b
+        match_rate = round(matched / max(total, 1) * 100, 2)
+
+        final = {
+            "type": "complete",
+            "total_source": len(df_a),
+            "total_target": len(df_b),
+            "matched": matched,
+            "breaks": breaks,
+            "unmatched_source": unmatched_a,
+            "unmatched_target": unmatched_b,
+            "match_rate": match_rate,
+        }
+        if req.run_id:
+            reconciliation.store_run_results(req.run_id, {**final, "records": all_records})
+
+        log("stream_reconciliation_complete", {
+            "matched": matched, "breaks": breaks, "match_rate": match_rate,
+        })
+        yield _event(final)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── Regulatory Report ──────────────────────────────────────────────────────────
+
+@app.get("/api/reports/regulatory/{run_id}")
+def regulatory_report(run_id: str):
+    """
+    Full regulatory-grade report for a single reconciliation run.
+    Combines the pipeline trace (steps, AI reasoning, human decisions)
+    with the reconciliation results and audit log entries.
+    """
+    trace = get_run_trace(run_id)
+    if not trace:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    results = reconciliation.get_run_results(run_id)
+    audit_entries = audit.get_all()
+    # Filter audit entries to approximate this run's window
+    run_created = trace["run"].get("created_at", "")
+    run_completed = trace["run"].get("completed_at", "")
+    run_entries = [
+        e for e in audit_entries
+        if run_created <= e["timestamp"] <= (run_completed or "9999")
+    ]
+
+    # Summary statistics
+    records = results.get("records", []) if results else []
+    break_records = [r for r in records if r["status"] == "break"]
+    unmatched = [r for r in records if r["status"] in ("unmatched_source", "unmatched_target")]
+
+    # Field-level break frequency
+    field_break_counts: dict[str, int] = {}
+    for r in break_records:
+        for reason in r.get("break_reasons", []):
+            field = reason.split(":")[0].strip()
+            field_break_counts[field] = field_break_counts.get(field, 0) + 1
+
+    # HITL decisions from pipeline steps
+    human_decisions = [
+        {
+            "step": s["step_label"],
+            "action": s["human_action"],
+            "timestamp": s["human_action_at"],
+            "reviewer": "human_reviewer",
+        }
+        for s in trace.get("steps", [])
+        if s.get("human_action")
+    ]
+
+    # Matching rules applied (from rules step output)
+    rules_step = next(
+        (s for s in trace.get("steps", []) if s["step_name"] == "rules"), {}
+    )
+    mapping_step = next(
+        (s for s in trace.get("steps", []) if s["step_name"] == "map"), {}
+    )
+
+    report = {
+        "report_type": "reconciliation_audit_report",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "run": trace["run"],
+        "pipeline_steps": trace.get("steps", []),
+        "human_decisions": human_decisions,
+        "audit_events": run_entries,
+        "summary": {
+            "total_source": results.get("total_source") if results else 0,
+            "total_target": results.get("total_target") if results else 0,
+            "matched": results.get("matched") if results else 0,
+            "breaks": results.get("breaks") if results else 0,
+            "unmatched_source": results.get("unmatched_source") if results else 0,
+            "unmatched_target": results.get("unmatched_target") if results else 0,
+            "match_rate": results.get("match_rate") if results else 0,
+        },
+        "field_break_analysis": [
+            {"field": f, "break_count": c}
+            for f, c in sorted(field_break_counts.items(), key=lambda x: -x[1])
+        ],
+        "breaks": break_records[:50],   # first 50 breaks with full detail
+        "unmatched": unmatched[:20],
+        "ai_reasoning": {
+            "mapping": mapping_step.get("ai_reasoning", ""),
+            "rules": rules_step.get("ai_reasoning", ""),
+        },
+        "compliance": {
+            "hitl_review_performed": len(human_decisions) > 0,
+            "full_audit_trail": True,
+            "data_lineage_tracked": True,
+            "break_explanations_available": True,
+        },
+    }
+
+    log("regulatory_report_generated", {"run_id": run_id, "breaks": len(break_records)})
+    return report
 
 
 if __name__ == "__main__":

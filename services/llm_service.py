@@ -72,6 +72,16 @@ async def _call_ollama(prompt: str, system: str, cfg: LLMConfig) -> str:
 
 async def understand_fields(columns: list[dict]) -> list[dict]:
     """Use LLM to understand what each column represents."""
+    cfg = get_llm_config()
+
+    # Privacy: headers_only mode sends only column names, never sample values
+    if cfg.privacy_mode == "headers_only":
+        columns_for_ai = [{"name": c.get("name", c)} for c in columns]
+        privacy_note = "\nNote: only column names are provided (privacy mode). Infer types from naming conventions."
+    else:
+        columns_for_ai = columns
+        privacy_note = ""
+
     prompt = f"""You are analyzing financial data columns for a reconciliation system.
 
 For each column below, determine:
@@ -81,7 +91,7 @@ For each column below, determine:
 4. Brief reasoning (1 sentence)
 
 Columns to analyze:
-{json.dumps(columns, indent=2)}
+{json.dumps(columns_for_ai, indent=2)}{privacy_note}
 
 Respond ONLY with a valid JSON array. Example:
 [

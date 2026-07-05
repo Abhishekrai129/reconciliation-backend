@@ -13,7 +13,8 @@ class LLMConfig(BaseModel):
     provider: LLMProvider = LLMProvider.anthropic
     model: str = "claude-sonnet-4-6"
     api_key: Optional[str] = None
-    base_url: Optional[str] = None  # for Ollama
+    base_url: Optional[str] = None         # for Ollama / private cloud
+    privacy_mode: str = "full"             # "full" | "headers_only"
 
 
 class ColumnProfile(BaseModel):
