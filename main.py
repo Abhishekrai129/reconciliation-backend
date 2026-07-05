@@ -234,6 +234,18 @@ def get_audit():
     return {"entries": audit.get_all()}
 
 
+class AuditLogRequest(BaseModel):
+    action: str
+    details: dict
+    llm_provider: Optional[str] = None
+    reasoning: Optional[str] = None
+
+@app.post("/api/audit/log")
+def post_audit_log(req: AuditLogRequest):
+    log(req.action, req.details, llm_provider=req.llm_provider, reasoning=req.reasoning)
+    return {"ok": True}
+
+
 # ── AI Data Chat ─────────────────────────────────────────────────────────────
 
 class DataChatRequest(BaseModel):
