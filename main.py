@@ -23,6 +23,8 @@ from services import rag_service
 from services.rag_service import init_rag_db
 from services import probabilistic_matcher
 from services import data_profiler
+from services import dictionary_service
+from services.dictionary_service import init_dict_db
 
 
 @asynccontextmanager
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI):
     init_db()
     init_pipeline_db()
     init_rag_db()
+    init_dict_db()
     yield
 
 
@@ -404,7 +407,26 @@ def pipeline_review(run_id: str, body: PipelineReviewRequest):
         f"Approved {approved}/{total} mappings, rejected {rejected}. "
         f"{active_rules} rules active."
     )
-    # Mark review step started if not already
+
+    # ── Learning loop: every confirmed mapping teaches the dictionary ──────
+    new_aliases = 0
+    for m in body.approved_mappings:
+        src = m.get("source_column", "")
+        tgt = m.get("target_column", "")
+        if src and tgt:
+            dictionary_service.record_confirmed_mapping(src, tgt, run_id=run_id)
+            new_aliases += 1
+
+    # ── Learning loop: value maps from approved rules ──────────────────────
+    for r in body.approved_rules:
+        threshold = r.get("threshold")
+        if isinstance(threshold, dict) and r.get("match_type") == "value_lookup":
+            src_col = r.get("source_column", "")
+            entry = dictionary_service.lookup_field(src_col)
+            field_type = entry["canonical_name"] if entry else src_col
+            for abbrev, full_form in threshold.items():
+                dictionary_service.learn_value_mapping(field_type, abbrev, str(full_form), run_id=run_id)
+
     start_step(run_id, "review", f"{total} mappings to review, {active_rules} rules")
     record_human_action(run_id, "review", action_summary)
     log("pipeline_review", {
@@ -412,14 +434,71 @@ def pipeline_review(run_id: str, body: PipelineReviewRequest):
         "approved_mappings": approved,
         "rejected_mappings": rejected,
         "active_rules": active_rules,
+        "dict_entries_updated": new_aliases,
     })
-    return {"ok": True}
+    return {"ok": True, "dict_entries_updated": new_aliases}
 
 
 @app.post("/api/pipeline/{run_id}/complete")
 def pipeline_complete(run_id: str, body: PipelineCompleteRequest):
     complete_run(run_id, body.match_rate, body.matched, body.breaks)
     return {"ok": True}
+
+
+# ── Field Dictionary & Rule Book ─────────────────────────────────────────────
+
+@app.get("/api/dictionary")
+def get_dictionary():
+    """Return all field dictionary entries, sorted by confirmation count."""
+    return {
+        "entries": dictionary_service.get_all_entries(),
+        "stats":   dictionary_service.get_stats(),
+        "log":     dictionary_service.get_learning_log(limit=30),
+    }
+
+@app.post("/api/dictionary/lookup")
+def dictionary_lookup(body: dict):
+    """Look up a single field name — returns its canonical entry."""
+    name = body.get("name", "")
+    entry = dictionary_service.lookup_field(name)
+    return {"entry": entry, "found": entry is not None}
+
+@app.post("/api/dictionary/learn")
+def dictionary_learn(body: dict):
+    """Manually teach the dictionary: add an alias or value mapping.
+
+    body: { "action": "alias" | "value_map",
+            "canonical_name": "Side",
+            "alias": "direction",            -- for alias
+            "abbreviation": "L", "full_form": "Long"  -- for value_map
+           }
+    """
+    action = body.get("action", "alias")
+    if action == "alias":
+        entry = dictionary_service.lookup_field(body.get("canonical_name", ""))
+        if entry:
+            conn = dictionary_service._conn()
+            aliases = json.loads(entry["aliases"])
+            new_alias = body.get("alias", "")
+            if new_alias and new_alias not in aliases:
+                aliases.append(new_alias)
+                conn.execute(
+                    "UPDATE field_dictionary SET aliases = ? WHERE id = ?",
+                    (json.dumps(aliases), entry["id"]),
+                )
+                conn.commit()
+            conn.close()
+    elif action == "value_map":
+        dictionary_service.learn_value_mapping(
+            body.get("canonical_name", ""),
+            body.get("abbreviation", ""),
+            body.get("full_form", ""),
+        )
+    return {"ok": True}
+
+@app.get("/api/dictionary/stats")
+def dictionary_stats():
+    return dictionary_service.get_stats()
 
 
 # ── Break RAG ─────────────────────────────────────────────────────────────────
