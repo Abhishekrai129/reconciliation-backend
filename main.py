@@ -190,21 +190,65 @@ async def map_schemas(body: dict):
 async def suggest_rules(body: dict):
     """
     body: { "mappings": [...], "file_a_id": "...", "file_b_id": "..." }
+
+    Strategy (Rule Book First):
+    1. Check rule book for any confirmed rules that match these columns.
+    2. For mappings covered by high-confidence rules (auto_apply=True), use stored rule.
+    3. For remaining unmapped fields, call LLM suggest_matching_rules.
+    4. Merge: rule book rules + LLM rules (LLM fills gaps, doesn't override confirmed).
     """
     mappings = body.get("mappings", [])
     file_a_id = body.get("file_a_id", "")
     file_b_id = body.get("file_b_id", "")
 
-    sample_a = file_processor.get_sample_data(file_a_id, 5) if file_a_id else []
-    sample_b = file_processor.get_sample_data(file_b_id, 5) if file_b_id else []
+    col_names_a = [m.get("source_column", "") for m in mappings]
+    col_names_b = [m.get("target_column", "") for m in mappings]
 
-    cfg = llm_service.get_llm_config()
-    rules = await llm_service.suggest_matching_rules(
-        mappings, {"file_a": sample_a, "file_b": sample_b}
-    )
+    # ── Step 1: Rule Book lookup ──────────────────────────────────────────
+    book_rules = dictionary_service.lookup_rules(col_names_a, col_names_b)
+    book_covered: set[str] = set()
+    final_rules: list[dict] = []
 
-    log("rules_suggested", {"rule_count": len(rules)}, llm_provider=cfg.provider)
-    return {"rules": rules}
+    for br in book_rules:
+        # Only auto-apply if confirmed_count >= threshold (auto_apply flag)
+        if br["auto_apply"]:
+            final_rules.append(br)
+            book_covered.add(br["source_column"])
+
+    # ── Step 2: LLM fills remaining gaps ─────────────────────────────────
+    remaining = [m for m in mappings if m.get("source_column") not in book_covered]
+
+    llm_rules: list[dict] = []
+    if remaining:
+        sample_a = file_processor.get_sample_data(file_a_id, 5) if file_a_id else []
+        sample_b = file_processor.get_sample_data(file_b_id, 5) if file_b_id else []
+        cfg = llm_service.get_llm_config()
+        llm_rules = await llm_service.suggest_matching_rules(
+            remaining, {"file_a": sample_a, "file_b": sample_b}
+        )
+
+    # ── Step 3: Merge — also include non-auto book rules as suggestions ───
+    non_auto_book = [br for br in book_rules if not br["auto_apply"]]
+    merged_llm = {r.get("source_column"): r for r in llm_rules}
+    for br in non_auto_book:
+        sc = br["source_column"]
+        if sc not in merged_llm:
+            merged_llm[sc] = br  # suggest confirmed-but-not-auto as default
+    llm_rules = list(merged_llm.values())
+
+    all_rules = final_rules + llm_rules
+    auto_count = len(final_rules)
+
+    log("rules_suggested", {
+        "rule_count": len(all_rules),
+        "from_rule_book": auto_count,
+        "from_llm": len(llm_rules),
+    })
+    return {
+        "rules": all_rules,
+        "rule_book_applied": auto_count,
+        "llm_suggested": len(llm_rules),
+    }
 
 
 # ── Reconciliation ────────────────────────────────────────────────────────────
@@ -408,7 +452,7 @@ def pipeline_review(run_id: str, body: PipelineReviewRequest):
         f"{active_rules} rules active."
     )
 
-    # ── Learning loop: every confirmed mapping teaches the dictionary ──────
+    # ── RL Loop 1: confirmed mappings → field dictionary aliases ──────────
     new_aliases = 0
     for m in body.approved_mappings:
         src = m.get("source_column", "")
@@ -417,13 +461,26 @@ def pipeline_review(run_id: str, body: PipelineReviewRequest):
             dictionary_service.record_confirmed_mapping(src, tgt, run_id=run_id)
             new_aliases += 1
 
-    # ── Learning loop: value maps from approved rules ──────────────────────
+    # ── RL Loop 2: approved rules → rule book (match type + threshold) ────
+    rules_learned = 0
+    auto_applied = 0
     for r in body.approved_rules:
+        src = r.get("source_column", "")
+        tgt = r.get("target_column", "")
+        match_type = r.get("match_type", "exact")
         threshold = r.get("threshold")
-        if isinstance(threshold, dict) and r.get("match_type") == "value_lookup":
-            src_col = r.get("source_column", "")
-            entry = dictionary_service.lookup_field(src_col)
-            field_type = entry["canonical_name"] if entry else src_col
+        if not src or not tgt:
+            continue
+
+        stored = dictionary_service.learn_rule(src, tgt, match_type, threshold, run_id=run_id)
+        rules_learned += 1
+        if stored.get("auto_apply"):
+            auto_applied += 1
+
+        # RL Loop 2b: value maps from lookup rules → field dictionary
+        if isinstance(threshold, dict) and match_type == "value_lookup":
+            entry = dictionary_service.lookup_field(src)
+            field_type = entry["canonical_name"] if entry else src
             for abbrev, full_form in threshold.items():
                 dictionary_service.learn_value_mapping(field_type, abbrev, str(full_form), run_id=run_id)
 
@@ -434,9 +491,16 @@ def pipeline_review(run_id: str, body: PipelineReviewRequest):
         "approved_mappings": approved,
         "rejected_mappings": rejected,
         "active_rules": active_rules,
-        "dict_entries_updated": new_aliases,
+        "dict_aliases_added": new_aliases,
+        "rules_written_to_book": rules_learned,
+        "auto_apply_unlocked": auto_applied,
     })
-    return {"ok": True, "dict_entries_updated": new_aliases}
+    return {
+        "ok": True,
+        "dict_aliases_added": new_aliases,
+        "rules_written_to_book": rules_learned,
+        "auto_apply_unlocked": auto_applied,
+    }
 
 
 @app.post("/api/pipeline/{run_id}/complete")
@@ -449,12 +513,37 @@ def pipeline_complete(run_id: str, body: PipelineCompleteRequest):
 
 @app.get("/api/dictionary")
 def get_dictionary():
-    """Return all field dictionary entries, sorted by confirmation count."""
+    """Return all field dictionary entries + rule book + learning log."""
     return {
-        "entries": dictionary_service.get_all_entries(),
-        "stats":   dictionary_service.get_stats(),
-        "log":     dictionary_service.get_learning_log(limit=30),
+        "entries":   dictionary_service.get_all_entries(),
+        "rule_book": dictionary_service.get_rule_book(),
+        "stats":     dictionary_service.get_stats(),
+        "log":       dictionary_service.get_learning_log(limit=50),
     }
+
+@app.get("/api/dictionary/rules")
+def get_rule_book():
+    return {"rules": dictionary_service.get_rule_book()}
+
+@app.post("/api/dictionary/rules/lookup")
+def lookup_rules(body: dict):
+    """Find applicable rules for a given set of column names."""
+    col_a = body.get("col_names_a", [])
+    col_b = body.get("col_names_b", [])
+    matched = dictionary_service.lookup_rules(col_a, col_b)
+    auto = [r for r in matched if r["auto_apply"]]
+    return {"matched_rules": matched, "auto_apply_rules": auto}
+
+@app.put("/api/dictionary/rules/{rule_id}")
+def edit_rule(rule_id: int, body: dict):
+    """Human edits a rule directly from the Knowledge Base UI."""
+    ok = dictionary_service.update_rule(
+        rule_id,
+        body.get("match_type", "exact"),
+        body.get("threshold"),
+        body.get("notes", ""),
+    )
+    return {"ok": ok}
 
 @app.post("/api/dictionary/lookup")
 def dictionary_lookup(body: dict):

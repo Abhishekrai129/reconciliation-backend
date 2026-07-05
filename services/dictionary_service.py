@@ -234,12 +234,33 @@ def init_dict_db():
             created_at      TEXT NOT NULL
         );
 
+        -- Rule Book: stores confirmed matching rules learned from human review
+        -- Each row = one field-pair rule confirmed by a human at least once.
+        -- confirmed_count tracks how many runs have validated this rule.
+        -- auto_apply triggers when confirmed_count >= auto_apply_threshold.
+        CREATE TABLE IF NOT EXISTS rule_book (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_source    TEXT NOT NULL,   -- e.g. "Execution Price"
+            canonical_target    TEXT NOT NULL,   -- e.g. "Execution Price"
+            match_type          TEXT NOT NULL,   -- exact | numeric_tolerance | date_tolerance | value_lookup | fuzzy
+            threshold           TEXT,            -- NULL, "0.01", or JSON dict for value_lookup
+            confirmed_count     INTEGER NOT NULL DEFAULT 1,
+            auto_apply          INTEGER NOT NULL DEFAULT 0,  -- 1 when confirmed >= threshold
+            auto_apply_threshold INTEGER NOT NULL DEFAULT 3, -- confirmations needed for auto-apply
+            last_confirmed      TEXT NOT NULL,
+            example_source_cols TEXT NOT NULL DEFAULT '[]',  -- raw col names seen for this canonical
+            example_target_cols TEXT NOT NULL DEFAULT '[]',
+            notes               TEXT DEFAULT '',
+            created_at          TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS learning_log (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             event_type      TEXT NOT NULL,
             canonical_name  TEXT,
             alias_added     TEXT,
             value_added     TEXT,
+            rule_detail     TEXT,
             run_id          TEXT,
             confirmed_by    TEXT DEFAULT 'human',
             created_at      TEXT NOT NULL
@@ -478,11 +499,190 @@ def get_stats() -> dict:
         total_aliases += len(json.loads(row[0]))
     value_maps = conn.execute("SELECT COUNT(*) FROM field_dictionary WHERE value_map != '{}'").fetchone()[0]
     learnings = conn.execute("SELECT COUNT(*) FROM learning_log").fetchone()[0]
+    rule_count = conn.execute("SELECT COUNT(*) FROM rule_book").fetchone()[0]
+    auto_rules = conn.execute("SELECT COUNT(*) FROM rule_book WHERE auto_apply = 1").fetchone()[0]
     conn.close()
     return {
-        "total_entries": total,
-        "confirmed_by_human": confirmed,
-        "total_aliases": total_aliases,
+        "total_entries":       total,
+        "confirmed_by_human":  confirmed,
+        "total_aliases":       total_aliases,
         "fields_with_value_maps": value_maps,
-        "total_learnings": learnings,
+        "total_learnings":     learnings,
+        "rule_book_count":     rule_count,
+        "auto_apply_rules":    auto_rules,
     }
+
+
+# ── Rule Book ──────────────────────────────────────────────────────────────────
+
+def learn_rule(
+    source_col: str,
+    target_col: str,
+    match_type: str,
+    threshold: Any,
+    run_id: str | None = None,
+) -> dict:
+    """Store or reinforce a confirmed matching rule in the rule book.
+
+    Called automatically from the pipeline review endpoint every time a human
+    approves a rule. The rule is keyed on canonical field names so it generalises
+    across different raw column names for the same concept.
+
+    Returns the stored rule dict with current confirmed_count and auto_apply flag.
+    """
+    conn = _conn()
+    now = _now()
+
+    # Resolve canonical names for both columns
+    src_entry = lookup_field(source_col)
+    tgt_entry = lookup_field(target_col)
+    canonical_src = src_entry["canonical_name"] if src_entry else source_col
+    canonical_tgt = tgt_entry["canonical_name"] if tgt_entry else target_col
+
+    threshold_str = json.dumps(threshold) if isinstance(threshold, dict) else (str(threshold) if threshold is not None else None)
+
+    existing = conn.execute(
+        "SELECT * FROM rule_book WHERE canonical_source = ? AND canonical_target = ?",
+        (canonical_src, canonical_tgt),
+    ).fetchone()
+
+    if existing:
+        new_count = existing["confirmed_count"] + 1
+        auto = 1 if new_count >= existing["auto_apply_threshold"] else 0
+
+        # Merge example column names
+        ex_src: list = json.loads(existing["example_source_cols"])
+        ex_tgt: list = json.loads(existing["example_target_cols"])
+        if source_col not in ex_src:
+            ex_src.append(source_col)
+        if target_col not in ex_tgt:
+            ex_tgt.append(target_col)
+
+        conn.execute(
+            """UPDATE rule_book SET
+               match_type = ?, threshold = ?, confirmed_count = ?,
+               auto_apply = ?, last_confirmed = ?,
+               example_source_cols = ?, example_target_cols = ?
+               WHERE id = ?""",
+            (match_type, threshold_str, new_count, auto, now,
+             json.dumps(ex_src), json.dumps(ex_tgt), existing["id"]),
+        )
+        rule_id = existing["id"]
+    else:
+        cur = conn.execute(
+            """INSERT INTO rule_book
+               (canonical_source, canonical_target, match_type, threshold,
+                confirmed_count, auto_apply, last_confirmed,
+                example_source_cols, example_target_cols, created_at)
+               VALUES (?,?,?,?,1,0,?,?,?,?)""",
+            (canonical_src, canonical_tgt, match_type, threshold_str, now,
+             json.dumps([source_col]), json.dumps([target_col]), now),
+        )
+        rule_id = cur.lastrowid
+
+    conn.execute(
+        """INSERT INTO learning_log
+           (event_type, canonical_name, rule_detail, run_id, created_at)
+           VALUES (?,?,?,?,?)""",
+        ("rule_confirmed",
+         f"{canonical_src} → {canonical_tgt}",
+         f"{match_type}  threshold={threshold_str}",
+         run_id, now),
+    )
+    conn.commit()
+    result = dict(conn.execute("SELECT * FROM rule_book WHERE id = ?", (rule_id,)).fetchone())
+    conn.close()
+
+    result["example_source_cols"] = json.loads(result["example_source_cols"])
+    result["example_target_cols"] = json.loads(result["example_target_cols"])
+    result["threshold_parsed"]    = json.loads(result["threshold"]) if result["threshold"] and result["threshold"].startswith("{") else result["threshold"]
+    return result
+
+
+def lookup_rules(col_names_a: list[str], col_names_b: list[str]) -> list[dict]:
+    """Find rule book entries applicable to these column sets.
+
+    For each column in A, resolve its canonical name, then find rule book
+    entries where canonical_source matches. Same for B side.
+    Returns matched rules translated back to the actual raw column names.
+
+    auto_apply=True rules are safe to apply without human review.
+    """
+    conn = _conn()
+    all_rules = conn.execute("SELECT * FROM rule_book ORDER BY confirmed_count DESC").fetchall()
+    conn.close()
+
+    # Build canonical → raw-name mappings for both sides
+    canonical_a: dict[str, str] = {}  # canonical → raw col name in file A
+    for col in col_names_a:
+        entry = lookup_field(col)
+        if entry:
+            canonical_a[entry["canonical_name"]] = col
+
+    canonical_b: dict[str, str] = {}
+    for col in col_names_b:
+        entry = lookup_field(col)
+        if entry:
+            canonical_b[entry["canonical_name"]] = col
+
+    matched = []
+    for r in all_rules:
+        cs, ct = r["canonical_source"], r["canonical_target"]
+        if cs in canonical_a and ct in canonical_b:
+            threshold_raw = r["threshold"]
+            threshold_parsed = (
+                json.loads(threshold_raw)
+                if threshold_raw and threshold_raw.startswith("{")
+                else (float(threshold_raw) if threshold_raw and threshold_raw not in ("None", "null") else None)
+            )
+            matched.append({
+                "source_column":    canonical_a[cs],
+                "target_column":    canonical_b[ct],
+                "canonical_source": cs,
+                "canonical_target": ct,
+                "match_type":       r["match_type"],
+                "threshold":        threshold_parsed,
+                "confirmed_count":  r["confirmed_count"],
+                "auto_apply":       bool(r["auto_apply"]),
+                "reasoning":        f"Rule book (confirmed ×{r['confirmed_count']}){' — auto-applied' if r['auto_apply'] else ''}",
+            })
+
+    return matched
+
+
+def get_rule_book() -> list[dict]:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM rule_book ORDER BY confirmed_count DESC, canonical_source"
+    ).fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["example_source_cols"] = json.loads(d["example_source_cols"])
+        d["example_target_cols"] = json.loads(d["example_target_cols"])
+        raw_t = d.get("threshold")
+        d["threshold_parsed"] = (
+            json.loads(raw_t)
+            if raw_t and raw_t.startswith("{")
+            else raw_t
+        )
+        result.append(d)
+    return result
+
+
+def update_rule(rule_id: int, match_type: str, threshold: Any, notes: str = "") -> bool:
+    """Human edits a rule directly from the Knowledge Base UI."""
+    conn = _conn()
+    threshold_str = json.dumps(threshold) if isinstance(threshold, dict) else (str(threshold) if threshold is not None else None)
+    conn.execute(
+        "UPDATE rule_book SET match_type = ?, threshold = ?, notes = ? WHERE id = ?",
+        (match_type, threshold_str, notes, rule_id),
+    )
+    conn.execute(
+        "INSERT INTO learning_log (event_type, rule_detail, created_at) VALUES (?,?,?)",
+        ("rule_edited", f"id={rule_id} match_type={match_type} threshold={threshold_str}", _now()),
+    )
+    conn.commit()
+    conn.close()
+    return True
