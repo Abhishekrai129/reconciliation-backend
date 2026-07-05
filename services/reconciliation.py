@@ -1,6 +1,7 @@
 import pandas as pd
 from typing import Any
 from services.file_processor import get_dataframe
+from services.data_profiler import score_field_match, confidence_band, hitl_required as _hitl_required
 
 # In-memory results store keyed by run_id
 _results_store: dict[str, dict] = {}
@@ -81,6 +82,7 @@ def run_reconciliation(
         target_data = {c.replace("_B", ""): row[c] for c in merged.columns if c.endswith("_B")}
         break_reasons = []
 
+        field_scores: dict[str, float] = {}
         for rule in rules:
             col = rule["source_column"]
             col_a = f"{col}_A"
@@ -92,18 +94,29 @@ def run_reconciliation(
             val_b = row.get(col_b)
 
             if pd.isna(val_a) and pd.isna(val_b):
+                field_scores[col] = 1.0
                 continue
 
             match_type = rule.get("match_type", "exact")
             threshold = rule.get("threshold")
 
-            is_match = _compare_values(val_a, val_b, match_type, threshold)
-            if not is_match:
-                break_reasons.append(
-                    f"{col}: {val_a} ≠ {val_b}"
-                )
+            # Real confidence score per field (0.0–1.0)
+            score = score_field_match(val_a, val_b, match_type, threshold)
+            field_scores[col] = score
 
-        if break_reasons:
+            if score < 0.5:
+                break_reasons.append(f"{col}: {val_a} ≠ {val_b}  [{score:.0%} confidence]")
+
+        # Weighted overall confidence
+        if field_scores:
+            weights = {r["source_column"]: float(r.get("weight", 1.0)) for r in rules}
+            total_w = sum(weights.get(c, 1.0) for c in field_scores)
+            overall = sum(field_scores[c] * weights.get(c, 1.0) for c in field_scores) / max(total_w, 1e-9)
+        else:
+            overall = 1.0
+
+        has_break = bool(break_reasons)
+        if has_break:
             breaks += 1
             status = "break"
         else:
@@ -113,7 +126,10 @@ def run_reconciliation(
         records.append({
             "match_key": row.get("_key_A", row.get("_key_B", "")),
             "status": status,
-            "match_probability": 1.0 if status == "matched" else 0.5,
+            "match_probability": round(overall, 4),
+            "confidence_band": confidence_band(overall),
+            "hitl_required": _hitl_required(overall, has_break),
+            "field_scores": {k: round(v, 4) for k, v in field_scores.items()},
             "source_data": source_data,
             "target_data": target_data,
             "break_reasons": break_reasons,

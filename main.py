@@ -22,6 +22,7 @@ from services.pipeline_tracker import (
 from services import rag_service
 from services.rag_service import init_rag_db
 from services import probabilistic_matcher
+from services import data_profiler
 
 
 @asynccontextmanager
@@ -102,6 +103,39 @@ def get_sample(file_id: str, n: int = 10):
         return {"data": file_processor.get_sample_data(file_id, n)}
     except KeyError:
         raise HTTPException(status_code=404, detail="File not found")
+
+
+# ── Data Intelligence Profiler ────────────────────────────────────────────────
+
+@app.post("/api/profile")
+def profile_pair(body: dict):
+    """Run the data intelligence profiler on two uploaded files.
+
+    body: { "file_a_id": "...", "file_b_id": "...",
+            "key_col_a": "...", "key_col_b": "..." }  # key_cols optional
+
+    Returns quality_score, all issues, HITL triggers, recommendations.
+    """
+    file_a_id = body.get("file_a_id", "")
+    file_b_id = body.get("file_b_id", "")
+    try:
+        df_a = file_processor.get_dataframe(file_a_id)
+        df_b = file_processor.get_dataframe(file_b_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    report = data_profiler.profile_files(
+        df_a, df_b,
+        key_col_a=body.get("key_col_a"),
+        key_col_b=body.get("key_col_b"),
+    )
+    log("data_profiled", {
+        "file_a_id": file_a_id,
+        "file_b_id": file_b_id,
+        "quality_score": report["quality_score"],
+        "issues": report["total_issues"],
+    })
+    return report
 
 
 # ── AI Field Understanding ────────────────────────────────────────────────────
