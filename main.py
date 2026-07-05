@@ -379,7 +379,7 @@ if __name__ == "__main__":
 from pathlib import Path
 from fastapi.responses import FileResponse
 
-SAMPLE_DIR = Path(__file__).parent.parent / "sample_data"
+SAMPLE_DIR = Path(__file__).parent / "sample_data"
 
 SAMPLE_FILES = {
     "trade_confirm_source":   ("internal_book.csv",                    "Trade Confirmation — Internal Book (CSV)"),

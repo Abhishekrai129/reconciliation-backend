@@ -1,0 +1,71 @@
+===== PDF EXTRACTION RESULT: oracle_invoice_jan2024.pdf =====
+EXTRACTION ENGINE: pdfplumber v0.9.0
+CONFIDENCE: 0.94
+PAGE COUNT: 2
+
+--- EXTRACTED FIELDS ---
+INVOICE NUMBER: INV-ORC-2024-0089
+VENDOR: Oracle Corp
+VENDOR ADDRESS: 500 Oracle Parkway, Redwood City, CA 94065
+BILL TO: Asset Management Corp, Finance Department
+PO NUMBER: PO-7823
+INVOICE DATE: 25 January 2024
+DUE DATE: 24 February 2024
+PAYMENT TERMS: Net 30
+
+LINE ITEMS:
+  1. Oracle Database Enterprise License (Annual)    $75,000.00
+  2. Oracle Support & Maintenance 12 months          $12,375.00
+  3. Implementation Consulting (5 days @ $420/day)   $2,100.00
+                                                    -----------
+SUBTOTAL:                                           $89,475.00
+TAX (0%):                                                $0.00
+                                                    -----------
+TOTAL DUE:                                          $89,375.00
+
+PAYMENT INSTRUCTIONS: Wire transfer to Oracle Financial Services
+BANK: JP Morgan Chase
+ACCOUNT: 4521-887-001
+ROUTING: 021000021
+REFERENCE: INV-ORC-2024-0089
+
+NOTE: Amount includes 2% consulting services levy applied per Master Service Agreement clause 4.2b.
+===== END EXTRACTION =====
+
+===== PDF EXTRACTION RESULT: accenture_invoice_jan2024.pdf =====
+EXTRACTION ENGINE: pdfplumber v0.9.0
+CONFIDENCE: 0.91
+PAGE COUNT: 3
+
+--- EXTRACTED FIELDS ---
+INVOICE NUMBER: ACC-INV-2024-Q1-0042
+VENDOR: Accenture LLP
+PO NUMBER: PO-7824
+INVOICE DATE: 28 January 2024
+DUE DATE: 14 March 2024
+PAYMENT TERMS: Net 45
+
+LINE ITEMS:
+  1. Strategy Consulting - Digital Transformation    $95,000.00
+  2. Data Analytics Practice (Week 3-4)              $32,000.00
+  3. Project Management Office                       $15,000.00
+                                                    -----------
+TOTAL DUE:                                         $142,000.00
+
+===== END EXTRACTION =====
+
+===== PDF EXTRACTION RESULT: microsoft_invoice_jan2024.pdf =====
+EXTRACTION ENGINE: pdfplumber v0.9.0
+CONFIDENCE: 0.97
+PAGE COUNT: 1
+
+--- EXTRACTED FIELDS ---
+INVOICE NUMBER: MSFT-2024-88421
+VENDOR: Microsoft Corporation
+PO NUMBER: PO-7825
+INVOICE DATE: 30 January 2024
+DUE DATE: 28 February 2024
+PAYMENT TERMS: Net 30
+TOTAL DUE: $24,750.00
+
+===== END EXTRACTION =====

@@ -1,0 +1,5 @@
+po_reference,vendor_id,vendor_name,amount_total,currency,invoice_date,line_items,cost_center,payment_terms,status
+PO-7823,V-1042,Oracle Corporation,87500.00,USD,2024-01-25,SOFTWARE_LICENSE_ANNUAL,IT-DEPT,NET30,approved
+PO-7824,V-2091,Accenture LLP,142000.00,USD,2024-01-28,CONSULTING_SERVICES_Q1,FIN-OPS,NET45,approved
+PO-7825,V-0318,Microsoft Corporation,24750.00,USD,2024-01-30,AZURE_CLOUD_SERVICES,IT-DEPT,NET30,approved
+PO-7826,V-1891,Deloitte LLP,95000.00,USD,2024-02-01,AUDIT_SERVICES_FY24,FIN-OPS,NET60,pending

@@ -1,0 +1,6 @@
+event_id,isin,ticker,event_type,ex_date,record_date,pay_date,amount_per_share,currency,status
+EVT-001,US02079K3059,GOOGL,Cash Dividend,2024-02-14,2024-02-15,2024-03-15,0.50,USD,confirmed
+EVT-002,US88160R1014,TSLA,Stock Split,2024-04-15,2024-04-16,2024-04-20,0.00,USD,confirmed
+EVT-003,US0378331005,AAPL,Cash Dividend,2024-02-09,2024-02-12,2024-02-15,0.24,USD,confirmed
+EVT-004,US5949181045,MSFT,Cash Dividend,2024-02-14,2024-02-15,2024-03-14,0.75,USD,confirmed
+EVT-005,US67066G1040,NVDA,Stock Split,2024-06-10,2024-06-11,2024-06-20,0.00,USD,pending

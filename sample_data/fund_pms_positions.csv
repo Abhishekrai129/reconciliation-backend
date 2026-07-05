@@ -1,0 +1,6 @@
+isin,ticker,description,quantity,market_value,currency,account,fund,as_of_date
+US0378331005,AAPL,Apple Inc,1250,228125.00,USD,GF-001,Alpha Growth Fund,2024-01-17
+US5949181045,MSFT,Microsoft Corporation,850,296050.00,USD,GF-001,Alpha Growth Fund,2024-01-17
+US02079K3059,GOOGL,Alphabet Inc Class A,200,28160.00,USD,VF-001,Value Fund,2024-01-17
+US88160R1014,TSLA,Tesla Inc,500,107650.00,USD,GF-001,Alpha Growth Fund,2024-01-17
+US67066G1040,NVDA,NVIDIA Corporation,300,218250.00,USD,GF-001,Alpha Growth Fund,2024-01-17

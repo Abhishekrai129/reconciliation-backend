@@ -1,0 +1,65 @@
+FROM: corporate-actions@bloomberg.net
+TO: ca-team@assetmanager.com
+SUBJECT: Corporate Action Announcement Batch - 14 February 2024
+
+================================================================================
+ANNOUNCEMENT 1 OF 4
+================================================================================
+ACTION TYPE: Cash Dividend
+ISSUER: Alphabet Inc Class A
+ISIN: US02079K3059
+TICKER: GOOGL US Equity
+EX-DATE: 14-FEB-2024
+RECORD DATE: 15-FEB-2024
+PAY DATE: 15-MAR-2024
+AMOUNT PER SHARE: USD 0.5023
+CURRENCY: USD
+SOURCE: Bloomberg Corporate Actions Feed v2.4
+CONFIDENCE: HIGH
+NOTE: Amount reflects Bloomberg FX-adjusted rate. Minor rounding from source.
+
+================================================================================
+ANNOUNCEMENT 2 OF 4
+================================================================================
+ACTION TYPE: Stock Split
+ISSUER: Tesla Inc
+ISIN: US88160R1014
+TICKER: TSLA US Equity
+EX-DATE: 16-APR-2024
+RECORD DATE: 17-APR-2024
+PAY DATE: 22-APR-2024
+SPLIT RATIO: 3-for-1
+AMOUNT PER SHARE: 0.00
+CURRENCY: USD
+SOURCE: Bloomberg Corporate Actions Feed v2.4
+NOTE: Record date differs from internal DB by 1 day - Bloomberg uses T+1.
+
+================================================================================
+ANNOUNCEMENT 3 OF 4
+================================================================================
+ACTION TYPE: Cash Dividend
+ISSUER: Apple Inc
+ISIN: US0378331005
+TICKER: AAPL US Equity
+EX-DATE: 09-FEB-2024
+RECORD DATE: 12-FEB-2024
+PAY DATE: 15-FEB-2024
+AMOUNT PER SHARE: USD 0.24
+CURRENCY: USD
+SOURCE: Bloomberg Corporate Actions Feed v2.4
+CONFIDENCE: HIGH
+
+================================================================================
+ANNOUNCEMENT 4 OF 4
+================================================================================
+ACTION TYPE: Cash Dividend
+ISSUER: Microsoft Corporation
+ISIN: US5949181045
+TICKER: MSFT US Equity
+EX-DATE: 14-FEB-2024
+RECORD DATE: 15-FEB-2024
+PAY DATE: 14-MAR-2024
+AMOUNT PER SHARE: USD 0.75
+CURRENCY: USD
+SOURCE: Bloomberg Corporate Actions Feed v2.4
+CONFIDENCE: HIGH
