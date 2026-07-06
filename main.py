@@ -276,6 +276,23 @@ def run_reconciliation(req: ReconcileRequest):
     if req.run_id:
         reconciliation.store_run_results(req.run_id, result)
 
+    # ── RL Outcome Feedback: reconciliation result → rule effectiveness ────
+    try:
+        break_field_counts: dict[str, int] = {}
+        for rec in result.get("records", []):
+            for reason in rec.get("break_reasons", []):
+                field = reason.split(":")[0].strip()
+                break_field_counts[field] = break_field_counts.get(field, 0) + 1
+
+        dictionary_service.record_outcome_feedback(
+            rules_applied=req.rules,
+            match_rate=result.get("match_rate", 0.0),
+            break_field_counts=break_field_counts,
+            run_id=req.run_id,
+        )
+    except Exception:
+        pass  # outcome feedback is non-critical
+
     log("reconciliation_run", {
         "matched": result["matched"],
         "breaks": result["breaks"],
@@ -451,6 +468,13 @@ def pipeline_review(run_id: str, body: PipelineReviewRequest):
         f"Approved {approved}/{total} mappings, rejected {rejected}. "
         f"{active_rules} rules active."
     )
+
+    # ── RL Loop 0: rejected mappings → negative signal ───────────────────
+    for rejected_id in body.rejected_mappings:
+        # rejected_id may be "src→tgt" or just the source column name
+        if "→" in str(rejected_id):
+            parts = str(rejected_id).split("→", 1)
+            dictionary_service.record_rejected_mapping(parts[0].strip(), parts[1].strip(), run_id=run_id)
 
     # ── RL Loop 1: confirmed mappings → field dictionary aliases ──────────
     new_aliases = 0

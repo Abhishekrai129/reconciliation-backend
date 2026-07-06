@@ -188,13 +188,14 @@ async def map_schemas(file_a_columns: list[dict], file_b_columns: list[dict]) ->
     column names (the 'name' field), not inferred labels. This function normalizes
     the LLM output back to actual column names after parsing.
     """
-    from services.dictionary_service import get_context_for_mapping, normalize_column_name
+    from services.dictionary_service import get_context_for_mapping, normalize_column_name, get_rejection_context
 
     # Extract actual column names for normalization after LLM call
     names_a = [c.get("name", str(c)) for c in file_a_columns]
     names_b = [c.get("name", str(c)) for c in file_b_columns]
 
-    dict_context = get_context_for_mapping(names_a, names_b)
+    dict_context      = get_context_for_mapping(names_a, names_b)
+    rejection_context = get_rejection_context(names_a, names_b)
 
     # Build a compact column list showing name + label side by side
     def _col_summary(cols: list[dict]) -> str:
@@ -208,9 +209,12 @@ async def map_schemas(file_a_columns: list[dict], file_b_columns: list[dict]) ->
             rows.append(f'  "{name}" ({label}, {dtype}){sample_str}')
         return "\n".join(rows)
 
+    rejection_block = f"\n{rejection_context}\n" if rejection_context else ""
+
     prompt = f"""You are mapping fields between two financial data sources for reconciliation.
 
 {dict_context}
+{rejection_block}
 
 FILE A columns (name | inferred_label | type):
 {_col_summary(file_a_columns)}

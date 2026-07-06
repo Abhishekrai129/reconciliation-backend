@@ -302,7 +302,12 @@ def init_dict_db():
             example_source_cols TEXT NOT NULL DEFAULT '[]',
             example_target_cols TEXT NOT NULL DEFAULT '[]',
             notes               TEXT DEFAULT '',
-            created_at          TEXT NOT NULL
+            created_at          TEXT NOT NULL,
+            -- RL effectiveness tracking
+            times_applied       INTEGER NOT NULL DEFAULT 0,
+            times_matched       INTEGER NOT NULL DEFAULT 0,
+            times_broke         INTEGER NOT NULL DEFAULT 0,
+            break_rate          REAL NOT NULL DEFAULT 0.0
         );
 
         CREATE TABLE IF NOT EXISTS learning_log (
@@ -316,8 +321,31 @@ def init_dict_db():
             confirmed_by    TEXT DEFAULT 'human',
             created_at      TEXT NOT NULL
         );
+
+        -- Negative signal: mappings a human has explicitly rejected.
+        -- Injected into LLM context as "do not suggest these pairs again."
+        CREATE TABLE IF NOT EXISTS rejected_pairs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_col      TEXT NOT NULL,
+            target_col      TEXT NOT NULL,
+            canonical_source TEXT,
+            canonical_target TEXT,
+            rejected_count  INTEGER NOT NULL DEFAULT 1,
+            last_rejected   TEXT NOT NULL,
+            run_id          TEXT,
+            created_at      TEXT NOT NULL
+        );
     """)
     conn.commit()
+
+    # Migrate existing rule_book tables that predate the effectiveness columns
+    for col, defval in [("times_applied","0"), ("times_matched","0"),
+                        ("times_broke","0"), ("break_rate","0.0")]:
+        try:
+            conn.execute(f"ALTER TABLE rule_book ADD COLUMN {col} REAL NOT NULL DEFAULT {defval}")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
 
     # Seed field dictionary if empty
     count = conn.execute("SELECT COUNT(*) FROM field_dictionary").fetchone()[0]
@@ -782,3 +810,164 @@ def update_rule(rule_id: int, match_type: str, threshold: Any, notes: str = "") 
     conn.commit()
     conn.close()
     return True
+
+
+# ── Negative signal: rejected mappings ────────────────────────────────────────
+
+def record_rejected_mapping(source_col: str, target_col: str, run_id: str | None = None):
+    """Store a human rejection so the LLM can be warned not to suggest it again.
+
+    Each rejection increments rejected_count. If the same pair is rejected
+    repeatedly, it becomes a strong negative signal.
+    """
+    conn = _conn()
+    now = _now()
+
+    src_entry = lookup_field(source_col)
+    tgt_entry = lookup_field(target_col)
+    canonical_src = src_entry["canonical_name"] if src_entry else None
+    canonical_tgt = tgt_entry["canonical_name"] if tgt_entry else None
+
+    existing = conn.execute(
+        "SELECT id, rejected_count FROM rejected_pairs WHERE source_col = ? AND target_col = ?",
+        (source_col, target_col),
+    ).fetchone()
+
+    if existing:
+        conn.execute(
+            "UPDATE rejected_pairs SET rejected_count = ?, last_rejected = ? WHERE id = ?",
+            (existing["rejected_count"] + 1, now, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO rejected_pairs
+               (source_col, target_col, canonical_source, canonical_target,
+                rejected_count, last_rejected, run_id, created_at)
+               VALUES (?,?,?,?,1,?,?,?)""",
+            (source_col, target_col, canonical_src, canonical_tgt, now, run_id, now),
+        )
+
+    conn.execute(
+        "INSERT INTO learning_log (event_type, canonical_name, rule_detail, run_id, created_at) VALUES (?,?,?,?,?)",
+        ("mapping_rejected", canonical_src, f"{source_col} → {target_col}", run_id, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_rejection_context(col_names_a: list[str], col_names_b: list[str]) -> str:
+    """Return a text block of previously rejected mappings for these column sets.
+
+    Injected into the LLM prompt so it knows what NOT to suggest.
+    """
+    try:
+        conn = _conn()
+        rows = conn.execute(
+            "SELECT source_col, target_col, rejected_count FROM rejected_pairs ORDER BY rejected_count DESC"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return ""
+
+    col_set_a = {c.lower() for c in col_names_a}
+    col_set_b = {c.lower() for c in col_names_b}
+
+    relevant = [
+        r for r in rows
+        if r["source_col"].lower() in col_set_a or r["target_col"].lower() in col_set_b
+    ]
+
+    if not relevant:
+        return ""
+
+    lines = ["PREVIOUSLY REJECTED MAPPINGS (do NOT suggest these again):"]
+    for r in relevant[:10]:
+        times = r["rejected_count"]
+        lines.append(f"  ✗ {r['source_col']} → {r['target_col']} (rejected {times}×)")
+    return "\n".join(lines)
+
+
+# ── Outcome feedback: reconciliation results → rule effectiveness ──────────────
+
+def record_outcome_feedback(
+    rules_applied: list[dict],
+    match_rate: float,
+    break_field_counts: dict[str, int],
+    run_id: str | None = None,
+):
+    """Feed reconciliation outcomes back into rule effectiveness scores.
+
+    Called after every reconciliation run. For each rule that was applied:
+    - Increment times_applied
+    - If the field it governed appears in break_field_counts, increment times_broke
+    - Otherwise increment times_matched
+    - Recompute break_rate = times_broke / times_applied
+    - If break_rate > 0.5 and times_applied >= 5, clear auto_apply (flag for review)
+
+    This closes the RL feedback loop: rules that consistently cause breaks
+    are automatically demoted.
+    """
+    if not rules_applied:
+        return
+
+    conn = _conn()
+    now = _now()
+
+    for rule in rules_applied:
+        canonical_src = rule.get("canonical_source", "")
+        canonical_tgt = rule.get("canonical_target", "")
+        if not canonical_src:
+            src_entry = lookup_field(rule.get("source_column", ""))
+            canonical_src = src_entry["canonical_name"] if src_entry else rule.get("source_column", "")
+
+        row = conn.execute(
+            "SELECT * FROM rule_book WHERE canonical_source = ? AND canonical_target = ?",
+            (canonical_src, canonical_tgt),
+        ).fetchone()
+
+        if not row:
+            continue
+
+        # Determine if this rule's field appeared in any break
+        src_col  = rule.get("source_column", canonical_src)
+        did_break = src_col in break_field_counts or canonical_src in break_field_counts
+
+        new_applied = (row["times_applied"] or 0) + 1
+        new_matched = (row["times_matched"] or 0) + (0 if did_break else 1)
+        new_broke   = (row["times_broke"]   or 0) + (1 if did_break else 0)
+        new_rate    = round(new_broke / new_applied, 4) if new_applied > 0 else 0.0
+
+        # Demote auto_apply if break_rate > 50% after at least 5 applications
+        still_auto = row["auto_apply"]
+        if new_applied >= 5 and new_rate > 0.5 and still_auto and row["confirmed_count"] < 10:
+            still_auto = 0
+            conn.execute(
+                "INSERT INTO learning_log (event_type, canonical_name, rule_detail, run_id, created_at) VALUES (?,?,?,?,?)",
+                ("rule_demoted", canonical_src,
+                 f"auto_apply cleared — break_rate={new_rate:.0%} over {new_applied} runs",
+                 run_id, now),
+            )
+
+        conn.execute(
+            """UPDATE rule_book SET times_applied=?, times_matched=?, times_broke=?,
+               break_rate=?, auto_apply=? WHERE id=?""",
+            (new_applied, new_matched, new_broke, new_rate, still_auto, row["id"]),
+        )
+
+    # Reinforce the confirmed_count of ALL applied rules when match_rate is very high
+    if match_rate >= 95.0:
+        for rule in rules_applied:
+            canonical_src = rule.get("canonical_source", rule.get("source_column", ""))
+            conn.execute(
+                """UPDATE rule_book SET confirmed_count = confirmed_count + 1,
+                   auto_apply = CASE WHEN confirmed_count + 1 >= auto_apply_threshold THEN 1 ELSE auto_apply END
+                   WHERE canonical_source = ?""",
+                (canonical_src,),
+            )
+        conn.execute(
+            "INSERT INTO learning_log (event_type, rule_detail, run_id, created_at) VALUES (?,?,?,?)",
+            ("outcome_reinforced", f"match_rate={match_rate:.1f}% — {len(rules_applied)} rules reinforced", run_id, now),
+        )
+
+    conn.commit()
+    conn.close()
