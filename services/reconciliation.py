@@ -204,14 +204,28 @@ def _compare_values(val_a: Any, val_b: Any, match_type: str, threshold: Any) -> 
             return abs(a - b) <= tol + 1e-9
 
         elif match_type == "value_lookup":
-            # threshold is a dict mapping abbreviations → full names (e.g. {"B":"Buy","GS":"Goldman Sachs"})
-            # Normalize both sides to the full-name canonical form
+            # threshold is a dict mapping abbreviations → full names (e.g. {"B":"Buy"})
+            # Merge with the dictionary's richer value_map at runtime so all known
+            # aliases (L→Buy, P→Buy, 1→Buy, etc.) are always covered.
             lookup: dict = threshold if isinstance(threshold, dict) else {}
+            try:
+                from services.dictionary_service import lookup_field
+                for raw in [str(val_a), str(val_b)]:
+                    entry = lookup_field(raw) or lookup_field(str(val_a))
+                    if entry:
+                        import json as _json
+                        vm = _json.loads(entry.get("value_map", "{}") if isinstance(entry.get("value_map"), str) else "{}")
+                        for k, v in vm.items():
+                            if k not in lookup:
+                                lookup[k] = v
+                        break
+            except Exception:
+                pass
             forward = {k.strip().lower(): v.strip().lower() for k, v in lookup.items()}
 
             def _normalize(v: str) -> str:
                 s = str(v).strip().lower()
-                return forward.get(s, s)  # abbrev → full name; full name stays as-is
+                return forward.get(s, s)
 
             return _normalize(str(val_a)) == _normalize(str(val_b))
 

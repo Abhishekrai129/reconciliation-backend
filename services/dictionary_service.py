@@ -23,7 +23,6 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from pathlib import Path
 from typing import Any
 
 DB_PATH = os.getenv("DICT_DB_PATH", "dictionary.db")
@@ -219,6 +218,62 @@ SEED_ENTRIES: list[tuple[str, str, str, list[str], dict]] = [
 
 # ── DB init ───────────────────────────────────────────────────────────────────
 
+
+# ── Built-in rules seeded into rule_book on first init ────────────────────────
+# Keyed by (canonical_source, canonical_target) — same field on both sides.
+# These are domain-agreed rules that don't need human confirmation to apply;
+# they start with confirmed_count=3 and auto_apply=1 so they are used immediately.
+
+BUILT_IN_RULES: list[tuple[str, str, str, Any, str]] = [
+    # (canonical_source, canonical_target, match_type, threshold, notes)
+    # Identifiers — must match exactly
+    ("Trade ID",    "Trade ID",    "exact",             None,  "Trade identifiers must match exactly"),
+    ("ISIN",        "ISIN",        "exact",             None,  "Security identifiers must match exactly"),
+    ("CUSIP",       "CUSIP",       "exact",             None,  "Security identifiers must match exactly"),
+    ("SEDOL",       "SEDOL",       "exact",             None,  "Security identifiers must match exactly"),
+    ("UETR",        "UETR",        "exact",             None,  "Payment end-to-end reference must match exactly"),
+    ("LEI",         "LEI",         "exact",             None,  "Legal entity identifier must match exactly"),
+    ("Account",     "Account",     "exact",             None,  "Account/portfolio codes must match exactly"),
+    ("GL Account",  "GL Account",  "exact",             None,  "GL account codes must match exactly"),
+    ("Ticker",      "Ticker",      "exact",             None,  "Ticker symbols must match exactly"),
+    # Dates — allow 0-day tolerance (same day required unless overridden)
+    ("Trade Date",      "Trade Date",      "date_tolerance", 0, "Trade dates must match to the same day"),
+    ("Settlement Date", "Settlement Date", "date_tolerance", 0, "Settlement dates must match to same day"),
+    ("Value Date",      "Value Date",      "date_tolerance", 0, "Value dates must match to same day"),
+    ("Expiry Date",     "Expiry Date",     "date_tolerance", 0, "Expiry dates must match to same day"),
+    ("Pay Date",        "Pay Date",        "date_tolerance", 0, "Pay dates must match to same day"),
+    ("Ex Date",         "Ex Date",         "date_tolerance", 0, "Ex-dates must match to same day"),
+    # Prices — allow ±0.01 tolerance (2 decimal rounding)
+    ("Execution Price", "Execution Price", "numeric_tolerance", 0.01, "Prices may differ by rounding (±0.01)"),
+    ("Rate",            "Rate",            "numeric_tolerance", 0.0001, "Interest/FX rates: 4 decimal precision"),
+    # Amounts/quantities — allow ±0.01 for amounts, ±1 for quantities
+    ("Notional",        "Notional",        "numeric_tolerance", 0.01, "Notional amounts: ±0.01 for rounding"),
+    ("Amount",          "Amount",          "numeric_tolerance", 0.01, "Amounts: ±0.01 for rounding"),
+    ("Net Amount",      "Net Amount",      "numeric_tolerance", 0.01, "Net amounts: ±0.01 for rounding"),
+    ("Quantity",        "Quantity",        "numeric_tolerance", 1.0,  "Quantities: ±1 unit (lot rounding)"),
+    ("Amount Per Share","Amount Per Share", "numeric_tolerance", 0.0001, "Per-share amounts: 4 decimal precision"),
+    # Direction / Side — value normalisation lookup
+    ("Side",  "Side",  "value_lookup",
+     {"B":"Buy","S":"Sell","BUY":"Buy","SELL":"Sell","1":"Buy","-1":"Sell",
+      "P":"Buy","V":"Sell","b":"Buy","s":"Sell","Long":"Buy","Short":"Sell","L":"Buy"},
+     "Buy/Sell indicators: normalise abbreviations before comparing"),
+    ("Dr/Cr", "Dr/Cr", "value_lookup",
+     {"D":"Debit","C":"Credit","DR":"Debit","CR":"Credit","d":"Debit","c":"Credit"},
+     "Debit/Credit indicators: normalise before comparing"),
+    # Counterparty — fuzzy match (name variants, abbreviations)
+    ("Counterparty", "Counterparty", "fuzzy", 0.80,
+     "Counterparty names may vary: Goldman Sachs vs GS — fuzzy 80%"),
+    # Currency / text identifiers — exact
+    ("Currency",  "Currency",  "exact", None, "Currency codes (ISO 4217) must match exactly"),
+    ("Product",   "Product",   "fuzzy", 0.80, "Product/instrument names may vary in label"),
+    ("Reference", "Reference", "fuzzy", 0.90, "Bank references: allow minor suffix variation"),
+    ("Event Type","Event Type","value_lookup",
+     {"DIV":"Dividend","SPLIT":"Stock Split","MERGE":"Merger","SPIN":"Spin-off",
+      "RIGH":"Rights Issue","TEND":"Tender Offer","BONU":"Bonus Issue"},
+     "Corporate action type codes: normalise before comparing"),
+]
+
+
 def init_dict_db():
     conn = _conn()
     conn.executescript("""
@@ -234,21 +289,17 @@ def init_dict_db():
             created_at      TEXT NOT NULL
         );
 
-        -- Rule Book: stores confirmed matching rules learned from human review
-        -- Each row = one field-pair rule confirmed by a human at least once.
-        -- confirmed_count tracks how many runs have validated this rule.
-        -- auto_apply triggers when confirmed_count >= auto_apply_threshold.
         CREATE TABLE IF NOT EXISTS rule_book (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            canonical_source    TEXT NOT NULL,   -- e.g. "Execution Price"
-            canonical_target    TEXT NOT NULL,   -- e.g. "Execution Price"
-            match_type          TEXT NOT NULL,   -- exact | numeric_tolerance | date_tolerance | value_lookup | fuzzy
-            threshold           TEXT,            -- NULL, "0.01", or JSON dict for value_lookup
+            canonical_source    TEXT NOT NULL,
+            canonical_target    TEXT NOT NULL,
+            match_type          TEXT NOT NULL,
+            threshold           TEXT,
             confirmed_count     INTEGER NOT NULL DEFAULT 1,
-            auto_apply          INTEGER NOT NULL DEFAULT 0,  -- 1 when confirmed >= threshold
-            auto_apply_threshold INTEGER NOT NULL DEFAULT 3, -- confirmations needed for auto-apply
+            auto_apply          INTEGER NOT NULL DEFAULT 0,
+            auto_apply_threshold INTEGER NOT NULL DEFAULT 3,
             last_confirmed      TEXT NOT NULL,
-            example_source_cols TEXT NOT NULL DEFAULT '[]',  -- raw col names seen for this canonical
+            example_source_cols TEXT NOT NULL DEFAULT '[]',
             example_target_cols TEXT NOT NULL DEFAULT '[]',
             notes               TEXT DEFAULT '',
             created_at          TEXT NOT NULL
@@ -268,10 +319,16 @@ def init_dict_db():
     """)
     conn.commit()
 
-    # Seed if empty
+    # Seed field dictionary if empty
     count = conn.execute("SELECT COUNT(*) FROM field_dictionary").fetchone()[0]
     if count == 0:
         _seed(conn)
+
+    # Seed built-in rules if rule_book is empty
+    rule_count = conn.execute("SELECT COUNT(*) FROM rule_book").fetchone()[0]
+    if rule_count == 0:
+        _seed_rules(conn)
+
     conn.close()
 
 
@@ -283,6 +340,31 @@ def _seed(conn: sqlite3.Connection):
                (canonical_name, domain, data_type, aliases, value_map, confirmed_count, created_at)
                VALUES (?, ?, ?, ?, ?, 0, ?)""",
             (canonical, domain, dtype, json.dumps(aliases), json.dumps(value_map), now),
+        )
+    conn.commit()
+
+
+def _seed_rules(conn: sqlite3.Connection):
+    """Seed BUILT_IN_RULES into rule_book with auto_apply=1 from day one.
+
+    confirmed_count starts at 3 (= auto_apply_threshold) so these rules are
+    immediately available without any human confirmations needed.
+    """
+    now = _now()
+    for canonical_src, canonical_tgt, match_type, threshold, notes in BUILT_IN_RULES:
+        threshold_str = (
+            json.dumps(threshold) if isinstance(threshold, dict)
+            else (str(threshold) if threshold is not None else None)
+        )
+        conn.execute(
+            """INSERT INTO rule_book
+               (canonical_source, canonical_target, match_type, threshold,
+                confirmed_count, auto_apply, auto_apply_threshold,
+                last_confirmed, example_source_cols, example_target_cols,
+                notes, created_at)
+               VALUES (?,?,?,?,3,1,3,?,?,?,?,?)""",
+            (canonical_src, canonical_tgt, match_type, threshold_str,
+             now, json.dumps([]), json.dumps([]), notes, now),
         )
     conn.commit()
 
@@ -327,6 +409,20 @@ def lookup_field(raw_name: str) -> dict | None:
     return best
 
 
+_FALLBACK_CONTEXT = """FIELD DICTIONARY (built-in — no DB required):
+  • Trade ID (identifier): aliases=[trade_id, trd_id, ref_no, txn_id, deal_id, order_id]
+  • Trade Date (date): aliases=[trd_dt, trade_date, TradeDate, td, execution_date]
+  • Settlement Date (date): aliases=[sttl_dt, settlement_date, settle_dt, value_date]
+  • Execution Price (price): aliases=[exec_px, price, px, fill_price, deal_price]
+  • Quantity (numeric): aliases=[qty, QTY, shares, units, lots, position]
+  • Side (side): aliases=[bs_ind, buy_sell, direction, action]  values=[B→Buy, S→Sell, D→Debit, C→Credit]
+  • Counterparty (text): aliases=[cpty, broker, dealer, party]  values=[GS→Goldman Sachs, JPM→JPMorgan]
+  • ISIN (identifier): aliases=[isin, security_id, instrument_id]
+  • Currency (currency): aliases=[ccy, CCY, curr, settlement_ccy]
+  • Notional (numeric): aliases=[notional, ntnl, face_value, gross_amount, consideration]
+  • Amount (numeric): aliases=[amount, value, gross, net, total]"""
+
+
 def get_context_for_mapping(col_names_a: list[str], col_names_b: list[str]) -> str:
     """Build a compact dictionary context string to inject into the LLM prompt.
 
@@ -342,7 +438,7 @@ def get_context_for_mapping(col_names_a: list[str], col_names_b: list[str]) -> s
             relevant[entry["canonical_name"]] = entry
 
     if not relevant:
-        return ""
+        return _FALLBACK_CONTEXT
 
     lines = ["FIELD DICTIONARY (use this to identify field meanings and value normalisation):"]
     for entry in relevant.values():
