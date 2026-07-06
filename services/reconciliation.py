@@ -1,16 +1,52 @@
+import json
+import sqlite3
+from pathlib import Path
 import pandas as pd
 from typing import Any
 from services.file_processor import get_dataframe
 from services.data_profiler import score_field_match, confidence_band, hitl_required as _hitl_required
 
-# In-memory results store keyed by run_id
-_results_store: dict[str, dict] = {}
+_DB_PATH = Path(__file__).parent.parent / "pipeline.db"
+
+
+def _results_conn():
+    conn = sqlite3.connect(str(_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reconciliation_results (
+            run_id TEXT PRIMARY KEY,
+            results_json TEXT NOT NULL,
+            saved_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
 
 def store_run_results(run_id: str, results: dict):
-    _results_store[run_id] = results
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    trimmed = {k: v for k, v in results.items() if k != "records"}
+    trimmed["records"] = results.get("records", [])[:500]  # cap at 500 to keep DB lean
+    with _results_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO reconciliation_results (run_id, results_json, saved_at) VALUES (?, ?, ?)",
+            (run_id, json.dumps(trimmed), now),
+        )
+        conn.commit()
+
 
 def get_run_results(run_id: str) -> dict | None:
-    return _results_store.get(run_id)
+    try:
+        with _results_conn() as conn:
+            row = conn.execute(
+                "SELECT results_json FROM reconciliation_results WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row:
+                return json.loads(row["results_json"])
+    except Exception:
+        pass
+    return None
 
 
 def run_reconciliation(
