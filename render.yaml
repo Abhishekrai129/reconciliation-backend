@@ -7,3 +7,9 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         sync: false
+      - key: LLM_PROVIDER
+        value: openai
+      - key: LLM_MODEL
+        value: openai/gpt-4o-mini
+      - key: OPENAI_BASE_URL
+        value: https://openrouter.ai/api/v1

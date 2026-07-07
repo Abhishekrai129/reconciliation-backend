@@ -1,6 +1,13 @@
+import os
 from pydantic import BaseModel
 from typing import Any, Optional
 from enum import Enum
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
 class LLMProvider(str, Enum):
@@ -9,12 +16,27 @@ class LLMProvider(str, Enum):
     ollama = "ollama"
 
 
+def _default_provider() -> LLMProvider:
+    v = os.getenv("LLM_PROVIDER", "openai").lower()
+    return LLMProvider(v) if v in ("anthropic", "openai", "ollama") else LLMProvider.openai
+
+
+def _default_model() -> str:
+    return os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
+
+
 class LLMConfig(BaseModel):
-    provider: LLMProvider = LLMProvider.anthropic
-    model: str = "claude-sonnet-4-6"
+    provider: LLMProvider = None          # type: ignore[assignment]
+    model: str = None                     # type: ignore[assignment]
     api_key: Optional[str] = None
-    base_url: Optional[str] = None         # for Ollama / private cloud
-    privacy_mode: str = "full"             # "full" | "headers_only"
+    base_url: Optional[str] = None        # for Ollama / OpenRouter / private cloud
+    privacy_mode: str = "full"            # "full" | "headers_only"
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.provider is None:
+            object.__setattr__(self, "provider", _default_provider())
+        if self.model is None:
+            object.__setattr__(self, "model", _default_model())
 
 
 class ColumnProfile(BaseModel):

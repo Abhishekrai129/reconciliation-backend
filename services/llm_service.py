@@ -12,11 +12,16 @@ Key design:
 import json
 import os
 import re
+import time
 from typing import Any
 from models.schemas import LLMConfig, LLMProvider
 
 
 _config = LLMConfig()
+
+# Current run context — set once per pipeline run so all LLM calls are tagged
+_current_run_id: str = ""
+_current_step: str = ""
 
 
 def set_llm_config(config: LLMConfig):
@@ -28,65 +33,135 @@ def get_llm_config() -> LLMConfig:
     return _config
 
 
+def set_run_context(run_id: str, step: str = ""):
+    """Call at the start of each pipeline step so LLM traces are tagged."""
+    global _current_run_id, _current_step
+    _current_run_id = run_id or ""
+    _current_step = step or ""
+
+
 # ── LLM call router ───────────────────────────────────────────────────────────
 
-async def call_llm(prompt: str, system: str = "") -> str:
+async def call_llm(prompt: str, system: str = "", step: str = "") -> str:
     cfg = get_llm_config()
+    effective_step = step or _current_step
 
     if cfg.provider == LLMProvider.anthropic:
-        return await _call_anthropic(prompt, system, cfg)
+        return await _call_anthropic(prompt, system, cfg, effective_step)
     elif cfg.provider == LLMProvider.openai:
-        return await _call_openai(prompt, system, cfg)
+        return await _call_openai(prompt, system, cfg, effective_step)
     elif cfg.provider == LLMProvider.ollama:
-        return await _call_ollama(prompt, system, cfg)
+        return await _call_ollama(prompt, system, cfg, effective_step)
 
     raise ValueError(f"Unknown provider: {cfg.provider}")
 
 
-async def _call_anthropic(prompt: str, system: str, cfg: LLMConfig) -> str:
+async def _call_anthropic(prompt: str, system: str, cfg: LLMConfig, step: str) -> str:
+    from services import audit
     import anthropic
     key = cfg.api_key or os.getenv("ANTHROPIC_API_KEY", "")
     client = anthropic.Anthropic(api_key=key)
-    msg = client.messages.create(
-        model=cfg.model,
-        max_tokens=4096,
-        system=system or "You are an expert financial data analyst specializing in reconciliation.",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return msg.content[0].text
+    raw_response = ""
+    tokens_in = tokens_out = None
+    t0 = time.perf_counter()
+    error = None
+    try:
+        msg = client.messages.create(
+            model=cfg.model,
+            max_tokens=4096,
+            system=system or "You are an expert financial data analyst specializing in reconciliation.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw_response = msg.content[0].text
+        tokens_in  = getattr(msg.usage, "input_tokens",  None)
+        tokens_out = getattr(msg.usage, "output_tokens", None)
+        return raw_response
+    except Exception as exc:
+        error = str(exc)
+        raise
+    finally:
+        audit.log_llm_call(
+            run_id=_current_run_id, step=step, provider="anthropic", model=cfg.model,
+            prompt=prompt, raw_response=raw_response,
+            tokens_in=tokens_in, tokens_out=tokens_out,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+            error=error,
+        )
 
 
-async def _call_openai(prompt: str, system: str, cfg: LLMConfig) -> str:
+async def _call_openai(prompt: str, system: str, cfg: LLMConfig, step: str) -> str:
+    from services import audit
     from openai import OpenAI
-    key = cfg.api_key or os.getenv("OPENAI_API_KEY", "")
-    client = OpenAI(api_key=key)
-    resp = client.chat.completions.create(
-        model=cfg.model,
-        messages=[
-            {"role": "system", "content": system or "You are an expert financial data analyst."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return resp.choices[0].message.content
+    key = cfg.api_key or os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
+    base_url = cfg.base_url or os.getenv("OPENAI_BASE_URL") or "https://openrouter.ai/api/v1"
+    client = OpenAI(api_key=key, **({"base_url": base_url} if base_url else {}))
+    raw_response = ""
+    tokens_in = tokens_out = None
+    t0 = time.perf_counter()
+    error = None
+    try:
+        resp = client.chat.completions.create(
+            model=cfg.model,
+            messages=[
+                {"role": "system", "content": system or "You are an expert financial data analyst."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw_response = resp.choices[0].message.content
+        if resp.usage:
+            tokens_in  = resp.usage.prompt_tokens
+            tokens_out = resp.usage.completion_tokens
+        return raw_response
+    except Exception as exc:
+        error = str(exc)
+        raise
+    finally:
+        audit.log_llm_call(
+            run_id=_current_run_id, step=step, provider=str(cfg.provider), model=cfg.model,
+            prompt=prompt, raw_response=raw_response,
+            tokens_in=tokens_in, tokens_out=tokens_out,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+            error=error,
+        )
 
 
-async def _call_ollama(prompt: str, system: str, cfg: LLMConfig) -> str:
+async def _call_ollama(prompt: str, system: str, cfg: LLMConfig, step: str) -> str:
+    from services import audit
     import ollama
     base_url = cfg.base_url or "http://localhost:11434"
     client = ollama.Client(host=base_url)
-    resp = client.chat(
-        model=cfg.model,
-        messages=[
-            {"role": "system", "content": system or "You are an expert financial data analyst."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return resp["message"]["content"]
+    raw_response = ""
+    tokens_in = tokens_out = None
+    t0 = time.perf_counter()
+    error = None
+    try:
+        resp = client.chat(
+            model=cfg.model,
+            messages=[
+                {"role": "system", "content": system or "You are an expert financial data analyst."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw_response = resp["message"]["content"]
+        tokens_in  = resp.get("prompt_eval_count")
+        tokens_out = resp.get("eval_count")
+        return raw_response
+    except Exception as exc:
+        error = str(exc)
+        raise
+    finally:
+        audit.log_llm_call(
+            run_id=_current_run_id, step=step, provider="ollama", model=cfg.model,
+            prompt=prompt, raw_response=raw_response,
+            tokens_in=tokens_in, tokens_out=tokens_out,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+            error=error,
+        )
 
 
 # ── JSON parsing helper ───────────────────────────────────────────────────────
 
-def _parse_json(text: str) -> Any:
+def parse_json_from_llm(text: str) -> Any:
     """Robustly extract JSON from LLM response (handles markdown fences)."""
     cleaned = text.strip()
     # Strip markdown code fences
@@ -161,7 +236,7 @@ Respond ONLY with a valid JSON array:
 
     response = await call_llm(prompt)
     try:
-        result = _parse_json(response)
+        result = parse_json_from_llm(response)
         if isinstance(result, list):
             # Ensure name field is preserved from original columns
             name_map = {c.get("name"): c for c in columns}
@@ -251,7 +326,7 @@ Match types: exact | fuzzy | numeric_tolerance | date_tolerance | value_lookup""
 
     response = await call_llm(prompt)
     try:
-        result = _parse_json(response)
+        result = parse_json_from_llm(response)
 
         # Handle LLM returning array directly instead of wrapped object
         if isinstance(result, list):
@@ -377,7 +452,7 @@ Respond ONLY with valid JSON array:
 
     response = await call_llm(prompt)
     try:
-        result = _parse_json(response)
+        result = parse_json_from_llm(response)
         rules = result if isinstance(result, list) else result.get("rules", [])
 
         if rules:
