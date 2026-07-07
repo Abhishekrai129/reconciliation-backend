@@ -27,6 +27,7 @@ from services.pipeline_tracker import (
 )
 from services import rag_service
 from services.rag_service import init_rag_db
+from services import supabase_service
 from services import probabilistic_matcher
 from services import data_profiler
 from services import dictionary_service
@@ -397,6 +398,29 @@ def run_reconciliation(req: ReconcileRequest):
         "breaks": result["breaks"],
         "match_rate": result["match_rate"],
     })
+
+    # ── Persist to Supabase (non-blocking best-effort) ────────────────────────
+    try:
+        sb_run_id = supabase_service.save_run_sync(
+            source_file=getattr(req, "file_a_name", req.file_a_id),
+            target_file=getattr(req, "file_b_name", req.file_b_id),
+            use_case=getattr(req, "use_case", "trade_confirmation"),
+            match_rate=result.get("match_rate", 0),
+            matched=result.get("matched", 0),
+            breaks=result.get("breaks", 0),
+            total_source=result.get("total_source", 0),
+            total_target=result.get("total_target", 0),
+        )
+        if sb_run_id:
+            broken = [r for r in result.get("records", []) if r.get("status") == "break"]
+            supabase_service.save_breaks_sync(sb_run_id, broken)
+            supabase_service.log_audit_sync(
+                sb_run_id, "reconciliation_complete", "Recon Engine",
+                f"{result.get('match_rate', 0)}% match rate, {result.get('breaks', 0)} breaks"
+            )
+    except Exception:
+        pass  # Supabase write is non-critical — never fail a reconciliation for it
+
     return result
 
 

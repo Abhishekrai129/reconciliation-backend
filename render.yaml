@@ -13,3 +13,7 @@ services:
         value: openai/gpt-4o-mini
       - key: OPENAI_BASE_URL
         value: https://openrouter.ai/api/v1
+      - key: SUPABASE_URL
+        value: https://aivgdszslsqsybugtrud.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
