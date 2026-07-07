@@ -201,6 +201,39 @@ SEED_ENTRIES: list[tuple[str, str, str, list[str], dict]] = [
       "bank_narrative", "bank_txn_id"],
      {}),
 
+    # ── Invoice / AP ─────────────────────────────────────────────────────
+    ("PO Reference", "invoice_ap", "identifier",
+     ["po_reference", "po_number", "po_ref", "PO_NUMBER", "po_no",
+      "purchase_order", "PurchaseOrder", "order_reference", "order_ref",
+      "po_id", "order_number", "OrderNumber"],
+     {}),
+
+    ("Vendor Name", "invoice_ap", "text",
+     ["vendor_name", "vendor", "Vendor", "VendorName", "supplier_name",
+      "supplier", "Supplier", "SupplierName", "payee", "Payee",
+      "beneficiary", "company_name", "company"],
+     {"Oracle Corp": "Oracle Corporation", "Accenture": "Accenture LLP",
+      "Microsoft": "Microsoft Corporation", "Deloitte": "Deloitte LLP",
+      "MSFT": "Microsoft Corporation", "ORCL": "Oracle Corporation"}),
+
+    ("Invoice Amount", "invoice_ap", "price",
+     ["amount_total", "amount_approved", "invoice_amount", "total_amount",
+      "InvoiceAmount", "total_due", "TotalDue", "net_amount", "gross_amount",
+      "billed_amount", "approved_amount", "invoice_value", "line_total"],
+     {}),
+
+    ("Invoice Number", "invoice_ap", "identifier",
+     ["invoice_number", "invoice_no", "InvoiceNumber", "inv_no",
+      "invoice_id", "bill_number", "billing_ref", "invoice_ref"],
+     {}),
+
+    ("Payment Terms", "invoice_ap", "text",
+     ["payment_terms", "PaymentTerms", "terms", "pay_terms",
+      "net_terms", "credit_terms", "due_terms"],
+     {"NET30": "Net 30", "NET45": "Net 45", "NET60": "Net 60",
+      "NET90": "Net 90", "N30": "Net 30", "N45": "Net 45",
+      "N60": "Net 60", "COD": "Cash on Delivery"}),
+
     # ── Corporate actions ─────────────────────────────────────────────────
     ("Event Type", "corporate_actions", "text",
      ["event_type", "EventType", "action_type", "ActionType",
@@ -267,6 +300,12 @@ BUILT_IN_RULES: list[tuple[str, str, str, Any, str]] = [
     ("Currency",  "Currency",  "exact", None, "Currency codes (ISO 4217) must match exactly"),
     ("Product",   "Product",   "fuzzy", 0.80, "Product/instrument names may vary in label"),
     ("Reference", "Reference", "fuzzy", 0.90, "Bank references: allow minor suffix variation"),
+    # Invoice / AP
+    ("PO Reference",  "PO Reference",  "exact",             None, "Purchase order references must match exactly"),
+    ("Invoice Amount","Invoice Amount", "numeric_tolerance", 50.0, "Invoice amounts: ±50 for rounding/tax differences"),
+    ("Invoice Number","Invoice Number", "exact",             None, "Invoice numbers must match exactly"),
+    ("Vendor Name",   "Vendor Name",   "fuzzy",             0.80, "Vendor names may vary: Oracle Corp vs Oracle Corporation"),
+    ("Payment Terms", "Payment Terms", "exact",             None, "Payment terms: exact after normalisation (Net 30 = NET30)"),
     ("Event Type","Event Type","value_lookup",
      {"DIV":"Dividend","SPLIT":"Stock Split","MERGE":"Merger","SPIN":"Spin-off",
       "RIGH":"Rights Issue","TEND":"Tender Offer","BONU":"Bonus Issue"},

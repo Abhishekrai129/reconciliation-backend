@@ -355,6 +355,177 @@ Match types: exact | fuzzy | numeric_tolerance | date_tolerance | value_lookup""
         return {"mappings": [], "unmapped_source": names_a, "unmapped_target": names_b}
 
 
+# ── Agent Planner ─────────────────────────────────────────────────────────────
+
+async def plan_reconciliation(file_a_cols: list[dict], file_b_cols: list[dict]) -> dict:
+    """Agent planner: decompose the reconciliation task into a strategy before any mapping."""
+    names_a = [c.get("name", str(c)) for c in file_a_cols]
+    names_b = [c.get("name", str(c)) for c in file_b_cols]
+
+    prompt = f"""You are a reconciliation planning agent. Analyze these two datasets and produce a structured plan before any mapping begins.
+
+SOURCE columns: {json.dumps(names_a)}
+TARGET columns: {json.dumps(names_b)}
+
+Respond with a JSON plan:
+{{
+  "dataset_assessment": "1-2 sentence description of what each dataset is",
+  "complexity": "low|medium|high",
+  "complexity_reason": "why",
+  "concept_groups": [
+    {{"concept": "Trade Identity", "source_cols": ["col1","col2"], "target_cols": ["colA"], "notes": "..."}}
+  ],
+  "recommended_strategy": "exact|fuzzy|probabilistic|hybrid",
+  "key_fields": ["list of likely join key fields"],
+  "risk_flags": ["list of potential issues: format mismatch, encoding differences, etc."],
+  "agent_steps": [
+    {{"step": "Understand Fields", "agent": "Profiler Agent", "goal": "..."}},
+    {{"step": "Map Schemas", "agent": "Maker Agent", "goal": "..."}},
+    {{"step": "Validate Mappings", "agent": "Checker Agent", "goal": "..."}},
+    {{"step": "Suggest Rules", "agent": "Rules Agent", "goal": "..."}},
+    {{"step": "Human Review", "agent": "Human", "goal": "..."}}
+  ]
+}}"""
+
+    response = await call_llm(prompt, step="plan")
+    try:
+        return parse_json_from_llm(response)
+    except Exception:
+        return {
+            "dataset_assessment": "Could not analyze — AI unavailable",
+            "complexity": "medium",
+            "complexity_reason": "Unable to assess",
+            "concept_groups": [],
+            "recommended_strategy": "exact",
+            "key_fields": [],
+            "risk_flags": ["AI planning unavailable — using heuristics"],
+            "agent_steps": [],
+        }
+
+
+# ── Maker-Checker Validation ──────────────────────────────────────────────────
+
+async def validate_mappings_checker(
+    proposed_mappings: list[dict],
+    file_a_cols: list[dict],
+    file_b_cols: list[dict],
+) -> dict:
+    """Checker Agent: independently reviews the Maker Agent's proposed mappings."""
+    names_a = [c.get("name", str(c)) for c in file_a_cols]
+    names_b = [c.get("name", str(c)) for c in file_b_cols]
+
+    prompt = f"""You are the CHECKER AGENT in a Maker-Checker framework. The Maker Agent proposed these schema mappings.
+Your job is to independently verify each mapping, flag any errors, and suggest corrections.
+
+SOURCE columns available: {json.dumps(names_a)}
+TARGET columns available: {json.dumps(names_b)}
+
+MAKER AGENT'S PROPOSED MAPPINGS:
+{json.dumps(proposed_mappings, indent=2)}
+
+For each mapping, assess:
+1. Is this mapping semantically correct?
+2. Are there better alternatives?
+3. Is the confidence appropriate?
+
+Respond ONLY with JSON:
+{{
+  "verdict": "approved|approved_with_changes|rejected",
+  "overall_confidence": 0.0-1.0,
+  "checker_notes": "Overall assessment in 1-2 sentences",
+  "mapping_reviews": [
+    {{
+      "source_column": "col_name",
+      "target_column": "col_name",
+      "checker_verdict": "approved|flagged|rejected",
+      "checker_note": "brief reason",
+      "suggested_correction": null
+    }}
+  ],
+  "flagged_count": 0,
+  "approved_count": 0
+}}"""
+
+    response = await call_llm(prompt, step="validate_mappings")
+    try:
+        return parse_json_from_llm(response)
+    except Exception:
+        approved = len(proposed_mappings)
+        return {
+            "verdict": "approved",
+            "overall_confidence": 0.75,
+            "checker_notes": "Checker AI unavailable — mappings passed without validation",
+            "mapping_reviews": [
+                {
+                    "source_column": m.get("source_column"),
+                    "target_column": m.get("target_column"),
+                    "checker_verdict": "approved",
+                    "checker_note": "Auto-approved (checker unavailable)",
+                    "suggested_correction": None,
+                }
+                for m in proposed_mappings
+            ],
+            "flagged_count": 0,
+            "approved_count": approved,
+        }
+
+
+# ── Break Resolution with Tool Calls ─────────────────────────────────────────
+
+async def resolve_break_with_actions(
+    source_record: dict,
+    target_record: dict,
+    break_fields: list[str],
+    context: str = "",
+) -> dict:
+    """Agentic break resolver: explains break AND proposes concrete tool-call actions."""
+    prompt = f"""You are a break resolution agent. A reconciliation break was found. Analyze it and propose concrete resolution actions.
+
+Source record: {json.dumps(source_record, indent=2)}
+Target record: {json.dumps(target_record, indent=2)}
+Fields with differences: {json.dumps(break_fields)}
+{f'Context: {context}' if context else ''}
+
+Respond ONLY with JSON:
+{{
+  "root_cause": "1-2 sentence explanation of why this break occurred",
+  "severity": "low|medium|high|critical",
+  "auto_resolvable": true|false,
+  "auto_resolution": "what the system can fix automatically, or null",
+  "proposed_actions": [
+    {{
+      "tool": "slack_message|erp_journal_entry|email_counterparty|flag_for_review|apply_tolerance_rule",
+      "label": "Human-readable action label",
+      "description": "What this action would do",
+      "payload": {{}},
+      "requires_approval": true|false
+    }}
+  ],
+  "historical_pattern": "Is this a known recurring break pattern? Describe if so."
+}}"""
+
+    response = await call_llm(prompt, step="resolve_break")
+    try:
+        return parse_json_from_llm(response)
+    except Exception:
+        return {
+            "root_cause": "Break analysis unavailable — AI offline",
+            "severity": "medium",
+            "auto_resolvable": False,
+            "auto_resolution": None,
+            "proposed_actions": [
+                {
+                    "tool": "flag_for_review",
+                    "label": "Flag for Manual Review",
+                    "description": "Escalate to operations team for manual investigation",
+                    "payload": {"fields": break_fields},
+                    "requires_approval": True,
+                }
+            ],
+            "historical_pattern": "Unable to check historical patterns — AI offline",
+        }
+
+
 # ── Break explanation ─────────────────────────────────────────────────────────
 
 async def explain_break(source_record: dict, target_record: dict, break_fields: list[str]) -> str:

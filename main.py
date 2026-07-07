@@ -2,6 +2,12 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +38,7 @@ async def lifespan(app: FastAPI):
     init_db()
     init_pipeline_db()
     init_rag_db()
+    rag_service.init_contract_library()
     init_dict_db()
     yield
 
@@ -90,7 +97,7 @@ def list_models():
 async def upload_file(file: UploadFile = File(...)):
     content = await file.read()
     try:
-        df = file_processor.read_file(content, file.filename)
+        df = await file_processor.read_file(content, file.filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not parse file: {e}")
 
@@ -153,6 +160,7 @@ async def understand_fields(body: dict):
         raise HTTPException(status_code=400, detail="No columns provided")
 
     cfg = llm_service.get_llm_config()
+    llm_service.set_run_context(body.get("run_id", ""), "understand_fields")
     enriched = await llm_service.understand_fields(columns)
 
     log(
@@ -174,6 +182,7 @@ async def map_schemas(body: dict):
     file_b_cols = body.get("file_b_columns", [])
 
     cfg = llm_service.get_llm_config()
+    llm_service.set_run_context(body.get("run_id", ""), "map_schemas")
     result = await llm_service.map_schemas(file_a_cols, file_b_cols)
 
     log(
@@ -223,6 +232,7 @@ async def suggest_rules(body: dict):
         sample_a = file_processor.get_sample_data(file_a_id, 5) if file_a_id else []
         sample_b = file_processor.get_sample_data(file_b_id, 5) if file_b_id else []
         cfg = llm_service.get_llm_config()
+        llm_service.set_run_context(body.get("run_id", ""), "suggest_rules")
         llm_rules = await llm_service.suggest_matching_rules(
             remaining, {"file_a": sample_a, "file_b": sample_b}
         )
@@ -249,6 +259,95 @@ async def suggest_rules(body: dict):
         "rule_book_applied": auto_count,
         "llm_suggested": len(llm_rules),
     }
+
+
+# ── Agentic Endpoints ────────────────────────────────────────────────────────
+
+@app.post("/api/ai/plan")
+async def agent_plan(body: dict):
+    """Agent Planner: decompose the reconciliation task before any mapping."""
+    file_a_cols = body.get("file_a_columns", [])
+    file_b_cols = body.get("file_b_columns", [])
+    run_id = body.get("run_id", "")
+    llm_service.set_run_context(run_id, "plan")
+    plan = await llm_service.plan_reconciliation(file_a_cols, file_b_cols)
+    log("agent_plan", {"complexity": plan.get("complexity"), "strategy": plan.get("recommended_strategy"),
+                       "concept_groups": len(plan.get("concept_groups", []))})
+    return plan
+
+
+@app.post("/api/ai/validate-mappings")
+async def validate_mappings(body: dict):
+    """Checker Agent: validate the Maker Agent's proposed mappings."""
+    proposed = body.get("mappings", [])
+    file_a_cols = body.get("file_a_columns", [])
+    file_b_cols = body.get("file_b_columns", [])
+    run_id = body.get("run_id", "")
+    llm_service.set_run_context(run_id, "validate_mappings")
+    result = await llm_service.validate_mappings_checker(proposed, file_a_cols, file_b_cols)
+    log("mappings_validated", {"verdict": result.get("verdict"),
+                                "flagged": result.get("flagged_count", 0),
+                                "approved": result.get("approved_count", 0)})
+    return result
+
+
+@app.post("/api/ai/resolve-break")
+async def resolve_break_agentic(body: dict):
+    """Agentic break resolver: searches contract RAG, then proposes tool-call actions."""
+    run_id = body.get("run_id", "")
+    break_fields = body.get("break_fields", [])
+    source_record = body.get("source_record", {})
+    target_record = body.get("target_record", {})
+
+    # ── Step 1: Search contract library for relevant clauses ─────────────────
+    # Build a natural-language query from the break fields and values
+    query_parts = []
+    for field in break_fields[:3]:
+        field_name = str(field).split(":")[0].strip()
+        src_val = source_record.get(field_name, "")
+        tgt_val = target_record.get(field_name, "")
+        query_parts.append(f"{field_name} discrepancy: {src_val} vs {tgt_val}")
+    contract_query = "Reconciliation break — " + "; ".join(query_parts) if query_parts else "reconciliation break"
+
+    contract_hits = rag_service.search_contracts(
+        query=contract_query,
+        break_fields=[str(f).split(":")[0].strip() for f in break_fields],
+        top_k=2,
+    )
+
+    # ── Step 2: Also check break history ─────────────────────────────────────
+    similar_breaks = rag_service.find_similar_breaks(source_record, target_record, break_fields, top_k=2)
+
+    # ── Step 3: Build context for LLM ────────────────────────────────────────
+    context_parts = []
+    if contract_hits:
+        context_parts.append("RELEVANT CONTRACT CLAUSES:\n" + "\n".join(
+            f"  [{h['section']}] {h['text']}" for h in contract_hits
+        ))
+    if similar_breaks:
+        context_parts.append("SIMILAR HISTORICAL BREAKS:\n" + "\n".join(
+            f"  Break #{b['id']}: {b['description']} → Resolution: {b.get('resolution', 'unresolved')}"
+            for b in similar_breaks if b.get("resolution")
+        ))
+    context = "\n\n".join(context_parts)
+
+    llm_service.set_run_context(run_id, "resolve_break")
+    result = await llm_service.resolve_break_with_actions(
+        source_record, target_record, break_fields, context
+    )
+
+    # Attach contract hits and similar breaks to the response
+    result["contract_clauses"] = contract_hits
+    result["similar_breaks"] = similar_breaks
+
+    log("break_resolved_agentic", {
+        "severity": result.get("severity"),
+        "actions": len(result.get("proposed_actions", [])),
+        "auto_resolvable": result.get("auto_resolvable"),
+        "contract_hits": len(contract_hits),
+        "similar_breaks": len(similar_breaks),
+    })
+    return result
 
 
 # ── Reconciliation ────────────────────────────────────────────────────────────
@@ -315,11 +414,13 @@ class BreakExplainRequest(BaseModel):
     source_record: dict
     target_record: dict
     break_fields: list[str]
+    run_id: Optional[str] = None
 
 
 @app.post("/api/ai/explain-break")
 async def explain_break(req: BreakExplainRequest):
     cfg = llm_service.get_llm_config()
+    llm_service.set_run_context(req.run_id or "", "explain_break")
     explanation = await llm_service.explain_break(
         req.source_record, req.target_record, req.break_fields
     )
@@ -337,6 +438,12 @@ async def explain_break(req: BreakExplainRequest):
 @app.get("/api/audit")
 def get_audit():
     return {"entries": audit.get_all()}
+
+
+@app.get("/api/audit/llm-calls")
+def get_llm_calls(run_id: Optional[str] = None):
+    """Return all llm_call trace rows, optionally filtered to a single run."""
+    return {"calls": audit.get_llm_calls(run_id)}
 
 
 class AuditLogRequest(BaseModel):
@@ -362,6 +469,7 @@ class DataChatRequest(BaseModel):
 async def data_chat(req: DataChatRequest):
     last_user = next((m["content"] for m in reversed(req.messages) if m["role"] == "user"), "")
     cfg = llm_service.get_llm_config()
+    llm_service.set_run_context("", "data_chat")
 
     # Get recent runs for context
     try:
@@ -614,6 +722,41 @@ def dictionary_stats():
     return dictionary_service.get_stats()
 
 
+# ── Contract / MSA RAG ───────────────────────────────────────────────────────
+
+class ContractUploadRequest(BaseModel):
+    doc_name: str
+    section: str
+    text: str
+    category: Optional[str] = ""
+    applies_to: Optional[list] = []
+
+
+@app.post("/api/contracts/upload")
+def contracts_upload(req: ContractUploadRequest):
+    chunk_id = rag_service.upload_contract_chunk(
+        req.doc_name, req.section, req.text, req.category or "", req.applies_to or []
+    )
+    log("contract_uploaded", {"doc_name": req.doc_name, "section": req.section, "chunk_id": chunk_id})
+    return {"chunk_id": chunk_id}
+
+
+@app.post("/api/contracts/search")
+def contracts_search(body: dict):
+    """Search contract library for clauses relevant to a break or query."""
+    results = rag_service.search_contracts(
+        query=body.get("query", ""),
+        break_fields=body.get("break_fields", []),
+        top_k=body.get("top_k", 3),
+    )
+    return {"results": results, "count": len(results)}
+
+
+@app.get("/api/contracts")
+def contracts_list():
+    return {"contracts": rag_service.get_all_contracts()}
+
+
 # ── Break RAG ─────────────────────────────────────────────────────────────────
 
 class BreakStoreRequest(BaseModel):
@@ -669,6 +812,27 @@ def breaks_list():
     return {"breaks": rag_service.get_all_breaks(100)}
 
 
+@app.post("/api/breaks")
+def breaks_unified(body: dict):
+    """Unified breaks endpoint — routes by action field (used by frontend api.ts)."""
+    action = body.get("action", "")
+    if action == "store":
+        break_id = rag_service.store_break(
+            body.get("source_fields", {}), body.get("target_fields", {}),
+            body.get("break_fields", []), body.get("resolution"),
+            body.get("resolution_type"), body.get("run_id"),
+        )
+        log("break_stored", {"break_id": break_id, "fields": body.get("break_fields", [])})
+        return {"break_id": break_id}
+    elif action == "similar":
+        similar = rag_service.find_similar_breaks(
+            body.get("source_fields", {}), body.get("target_fields", {}),
+            body.get("break_fields", []), body.get("top_k", 3),
+        )
+        return {"similar": similar}
+    raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+
+
 # ── Schema Rule Library ────────────────────────────────────────────────────────
 
 class RuleLibrarySaveRequest(BaseModel):
@@ -701,6 +865,23 @@ def rules_lookup(req: RuleLibraryLookupRequest):
 @app.get("/api/rules/library")
 def rules_library_list():
     return {"entries": rag_service.get_all_rule_library()}
+
+
+@app.post("/api/rules")
+def rules_unified(body: dict):
+    """Unified rules endpoint — routes by action field (used by frontend api.ts)."""
+    action = body.get("action", "")
+    if action == "save":
+        fp = rag_service.save_rule_library(
+            body.get("source_cols", []), body.get("target_cols", []),
+            body.get("confirmed_mappings", []), body.get("confirmed_rules", []),
+        )
+        log("rule_library_saved", {"fingerprint": fp, "rules": len(body.get("confirmed_rules", []))})
+        return {"fingerprint": fp}
+    elif action == "lookup":
+        result = rag_service.get_rule_library(body.get("source_cols", []), body.get("target_cols", []))
+        return {"found": result is not None, "library": result}
+    raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
 
 # ── Probabilistic Reconciliation ───────────────────────────────────────────────
@@ -891,6 +1072,12 @@ async def stream_reconciliation(req: StreamReconcileRequest):
 
 # ── Regulatory Report ──────────────────────────────────────────────────────────
 
+@app.get("/api/reports")
+def regulatory_report_by_query(run_id: str):
+    """Alias used by frontend: GET /api/reports?run_id=X"""
+    return regulatory_report(run_id)
+
+
 @app.get("/api/reports/regulatory/{run_id}")
 def regulatory_report(run_id: str):
     """
@@ -999,13 +1186,13 @@ SAMPLE_FILES = {
     "trade_confirm_source":   ("internal_book.csv",                    "Trade Confirmation — Internal Book (CSV)"),
     "trade_confirm_target":   ("broker_feed.csv",                      "Trade Confirmation — Broker FIX Feed (CSV)"),
     "nostro_source":          ("nostro_internal_ledger.csv",           "Cash/Nostro — Internal Ledger (CSV)"),
-    "nostro_target":          ("citi_mt940_statement.txt",             "Cash/Nostro — Bank MT940 Statement (SWIFT)"),
+    "nostro_target":          ("citi_mt940_statement.txt",             "Cash/Nostro — Citi SWIFT MT940 (semi-structured)"),
     "position_source":        ("fund_pms_positions.csv",               "Position Recon — Fund PMS (CSV)"),
     "position_target":        ("statestreet_custodian_extract.csv",    "Position Recon — Custodian Report (CSV)"),
     "corp_actions_source":    ("corporate_events_db.csv",              "Corporate Actions — Events DB (CSV)"),
-    "corp_actions_target":    ("bloomberg_email_announcements.txt",    "Corporate Actions — Bloomberg Email (Unstructured)"),
+    "corp_actions_target":    ("bloomberg_email_announcements.txt",    "Corporate Actions — Bloomberg Email Feed (unstructured)"),
     "invoice_source":         ("sap_erp_purchase_orders.csv",          "Invoice/AP — SAP ERP POs (CSV)"),
-    "invoice_target":         ("vendor_invoices_pdf_extracted.txt",    "Invoice/AP — Vendor PDF Invoices (Extracted)"),
+    "invoice_target":         ("vendor_invoices_pdf_extracted.txt",    "Invoice/AP — PDF Invoice Extraction (unstructured)"),
 }
 
 

@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 import pandas as pd
+from services import llm_service
 
 
 SUPPORTED_FORMATS = {
@@ -226,68 +227,98 @@ def parse_swift_mt940(content: bytes) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def read_file(content: bytes, filename: str) -> pd.DataFrame:
+async def _parse_with_llm(content: bytes) -> pd.DataFrame:
+    text = content.decode("utf-8", errors="replace")
+    if len(text) > 20000:
+        text = text[:20000] + "\n...[TRUNCATED]..."
+        
+    prompt = f"""You are a data extraction AI. Extract the tabular data from the following raw text.
+Return ONLY a valid JSON array of objects, where each object represents a row and keys are column names.
+If there is no tabular data, return an empty array [].
+
+Raw Text:
+{text}"""
+
+    response = await llm_service.call_llm(prompt, system="You are an expert data extraction AI.", step="llm_fallback_parse")
+    result = llm_service.parse_json_from_llm(response)
+    
+    if not isinstance(result, list):
+        raise ValueError("LLM did not return a JSON array.")
+        
+    if not result:
+        raise ValueError("LLM returned an empty array.")
+        
+    return pd.DataFrame(result)
+
+
+async def read_file(content: bytes, filename: str) -> pd.DataFrame:
     ext = Path(filename).suffix.lower()
 
-    if ext == ".txt" and _is_swift_mt940(content):
-        return parse_swift_mt940(content)
-
-    if ext == ".txt" and _is_bloomberg_email(content):
-        return parse_bloomberg_email(content)
-
-    if ext == ".txt" and _is_pdf_extraction(content):
-        return parse_pdf_invoices(content)
-
-    if ext in (".csv", ".txt"):
-        # Try comma first, then pipe, then tab
-        for sep in [",", "|", "\t", ";"]:
-            try:
-                df = pd.read_csv(io.BytesIO(content), sep=sep, encoding="utf-8-sig")
-                if len(df.columns) > 1:
-                    return df
-            except Exception:
-                continue
-        return pd.read_csv(io.BytesIO(content))
-
-    elif ext == ".tsv":
-        return pd.read_csv(io.BytesIO(content), sep="\t")
-
-    elif ext in (".xlsx", ".xls"):
-        return pd.read_excel(io.BytesIO(content))
-
-    elif ext == ".json":
-        data = json.loads(content)
-        if isinstance(data, list):
-            return pd.DataFrame(data)
-        elif isinstance(data, dict):
-            # Try records key or flatten
-            for key in ["data", "records", "rows", "items"]:
-                if key in data and isinstance(data[key], list):
-                    return pd.DataFrame(data[key])
-            return pd.DataFrame([data])
-
-    elif ext == ".xml":
-        import xmltodict
-        data = xmltodict.parse(content)
-        # Flatten first list found
-        def find_list(d):
-            for v in d.values():
-                if isinstance(v, list):
-                    return v
-                elif isinstance(v, dict):
-                    result = find_list(v)
-                    if result:
-                        return result
-            return None
-        rows = find_list(data)
-        if rows:
-            return pd.DataFrame(rows)
-        return pd.json_normalize(data)
-
-    elif ext == ".parquet":
-        return pd.read_parquet(io.BytesIO(content))
-
-    raise ValueError(f"Unsupported file format: {ext}")
+    try:
+        if ext == ".txt" and _is_swift_mt940(content):
+            return parse_swift_mt940(content)
+    
+        if ext == ".txt" and _is_bloomberg_email(content):
+            return parse_bloomberg_email(content)
+    
+        if ext == ".txt" and _is_pdf_extraction(content):
+            return parse_pdf_invoices(content)
+    
+        if ext in (".csv", ".txt"):
+            # Try comma first, then pipe, then tab
+            for sep in [",", "|", "\t", ";"]:
+                try:
+                    df = pd.read_csv(io.BytesIO(content), sep=sep, encoding="utf-8-sig")
+                    if len(df.columns) > 1:
+                        return df
+                except Exception:
+                    continue
+            return pd.read_csv(io.BytesIO(content))
+    
+        elif ext == ".tsv":
+            return pd.read_csv(io.BytesIO(content), sep="\t")
+    
+        elif ext in (".xlsx", ".xls"):
+            return pd.read_excel(io.BytesIO(content))
+    
+        elif ext == ".json":
+            data = json.loads(content)
+            if isinstance(data, list):
+                return pd.DataFrame(data)
+            elif isinstance(data, dict):
+                # Try records key or flatten
+                for key in ["data", "records", "rows", "items"]:
+                    if key in data and isinstance(data[key], list):
+                        return pd.DataFrame(data[key])
+                return pd.DataFrame([data])
+    
+        elif ext == ".xml":
+            import xmltodict
+            data = xmltodict.parse(content)
+            # Flatten first list found
+            def find_list(d):
+                for v in d.values():
+                    if isinstance(v, list):
+                        return v
+                    elif isinstance(v, dict):
+                        result = find_list(v)
+                        if result:
+                            return result
+                return None
+            rows = find_list(data)
+            if rows:
+                return pd.DataFrame(rows)
+            return pd.json_normalize(data)
+    
+        elif ext == ".parquet":
+            return pd.read_parquet(io.BytesIO(content))
+    
+        raise ValueError(f"Unsupported file format: {ext}")
+    except Exception as e:
+        try:
+            return await _parse_with_llm(content)
+        except Exception as llm_e:
+            raise ValueError(f"Failed to parse natively ({str(e)}) and LLM fallback failed ({str(llm_e)})")
 
 
 def profile_dataframe(df: pd.DataFrame, filename: str, file_id: str) -> dict:

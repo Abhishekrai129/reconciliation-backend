@@ -288,3 +288,203 @@ def get_all_rule_library() -> list[dict]:
             pass
         result.append(d)
     return result
+
+
+# ── Contract / MSA RAG ────────────────────────────────────────────────────────
+# Stores chunks of legal agreements (MSAs, SLAs, term sheets) as embeddings.
+# At break resolution time, searches for clauses relevant to the discrepancy.
+
+_CONTRACT_SEED = [
+    {
+        "doc_name": "Master Service Agreement v2.3",
+        "section": "Section 3.2 — Invoice Tolerance",
+        "text": "Invoice discrepancies of USD 100 or less are deemed administratively acceptable and shall not constitute a breach. The receiving party must notify the issuing party of any discrepancy exceeding USD 100 within 5 business days of invoice receipt.",
+        "category": "invoice_tolerance",
+        "applies_to": ["amount_total", "invoice_amount", "net_amount", "gross_amount"],
+    },
+    {
+        "doc_name": "Master Service Agreement v2.3",
+        "section": "Section 3.5 — Payment Terms Variance",
+        "text": "Payment terms stated as NET-30, Net 30, or N30 are equivalent and interchangeable. Variations in payment term notation across systems do not constitute a discrepancy.",
+        "category": "payment_terms_normalization",
+        "applies_to": ["payment_terms", "terms", "net_days"],
+    },
+    {
+        "doc_name": "Master Service Agreement v2.3",
+        "section": "Section 4.1 — Settlement Date Tolerance",
+        "text": "Settlement dates may vary by up to 2 business days due to banking holidays, time zone differences, or system processing delays. Discrepancies within this window shall be automatically reconciled.",
+        "category": "date_tolerance",
+        "applies_to": ["settlement_date", "value_date", "payment_date", "due_date"],
+    },
+    {
+        "doc_name": "ISDA Master Agreement 2002",
+        "section": "Section 6(e) — Price Tolerance",
+        "text": "Price discrepancies arising from rounding differences of up to 0.01% of the notional value, or USD 0.01 per unit, shall be considered immaterial. Discrepancies exceeding 0.5% of notional require written approval from both parties within 48 hours.",
+        "category": "price_tolerance",
+        "applies_to": ["price", "exec_px", "execution_price", "clean_price", "dirty_price", "unit_price"],
+    },
+    {
+        "doc_name": "ISDA Master Agreement 2002",
+        "section": "Section 9 — Trade Quantity Tolerance",
+        "text": "Quantity discrepancies of 1 unit or less for equity instruments, or 1,000 units for fixed income instruments, are within permissible rounding tolerance and shall not be treated as breaks.",
+        "category": "quantity_tolerance",
+        "applies_to": ["quantity", "qty", "shares", "notional_quantity", "face_value"],
+    },
+    {
+        "doc_name": "Prime Brokerage Agreement",
+        "section": "Section 12.3 — Vendor Name Equivalence",
+        "text": "Legal entity names and their abbreviations are considered equivalent when the first 6 characters match and the entity's LEI (Legal Entity Identifier) is consistent. System-generated abbreviations do not require manual reconciliation.",
+        "category": "entity_name_normalization",
+        "applies_to": ["vendor_name", "counterparty", "entity_name", "company_name", "legal_entity"],
+    },
+    {
+        "doc_name": "Custody Agreement — State Street",
+        "section": "Annex B — Corporate Actions",
+        "text": "Corporate action event notifications received via Bloomberg may differ from internal records by up to 48 hours due to feed latency. Discrepancies in ex-dates, record dates, or payment dates within this window are system timing artefacts and not breaks.",
+        "category": "corporate_actions",
+        "applies_to": ["ex_date", "record_date", "pay_date", "event_date", "announcement_date"],
+    },
+    {
+        "doc_name": "Nostro Reconciliation SLA",
+        "section": "Section 2.1 — SWIFT MT940 Formatting",
+        "text": "SWIFT MT940 statements use YYYYMMDD date format and may omit leading zeros. Credit entries prefixed with C and debit entries prefixed with D are canonical representations. System translations to full date formats and Buy/Sell terminology are accepted equivalents.",
+        "category": "swift_formatting",
+        "applies_to": ["date", "transaction_date", "credit_debit", "dr_cr", "debit_credit"],
+    },
+]
+
+
+def init_contract_library():
+    """Create contract_library table and seed with MSA/agreement clauses."""
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS contract_library (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_name    TEXT NOT NULL,
+                section     TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                category    TEXT,
+                applies_to  TEXT,
+                embedding   TEXT,
+                created_at  TEXT NOT NULL
+            )
+        """)
+        c.commit()
+
+        # Seed if empty
+        count = c.execute("SELECT COUNT(*) FROM contract_library").fetchone()[0]
+        if count == 0:
+            now = datetime.now(timezone.utc).isoformat()
+            for clause in _CONTRACT_SEED:
+                emb = _embed(clause["text"])
+                c.execute(
+                    """INSERT INTO contract_library
+                       (doc_name, section, text, category, applies_to, embedding, created_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        clause["doc_name"],
+                        clause["section"],
+                        clause["text"],
+                        clause.get("category"),
+                        json.dumps(clause.get("applies_to", [])),
+                        json.dumps(emb) if emb else None,
+                        now,
+                    ),
+                )
+            c.commit()
+
+
+def upload_contract_chunk(
+    doc_name: str,
+    section: str,
+    text: str,
+    category: str = "",
+    applies_to: Optional[list] = None,
+) -> int:
+    """Store a new contract clause/chunk with embedding."""
+    emb = _embed(text)
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        cur = c.execute(
+            """INSERT INTO contract_library
+               (doc_name, section, text, category, applies_to, embedding, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (doc_name, section, text, category, json.dumps(applies_to or []),
+             json.dumps(emb) if emb else None, now),
+        )
+        c.commit()
+        return cur.lastrowid
+
+
+def search_contracts(
+    query: str,
+    break_fields: Optional[list] = None,
+    top_k: int = 3,
+) -> list[dict]:
+    """Search contract library for clauses relevant to a break.
+
+    Uses embedding similarity when available; falls back to:
+    1. Field name overlap with applies_to column
+    2. Keyword overlap with clause text
+    """
+    q_emb = _embed(query)
+    break_fields = break_fields or []
+
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM contract_library").fetchall()
+
+    if not rows:
+        return []
+
+    scored = []
+    for row in rows:
+        r = dict(row)
+        score = 0.0
+
+        # Embedding similarity
+        if q_emb and r.get("embedding"):
+            try:
+                score = _cosine(q_emb, json.loads(r["embedding"]))
+            except Exception:
+                score = 0.0
+        else:
+            # Fallback 1: field name overlap with applies_to
+            try:
+                applies = set(json.loads(r.get("applies_to", "[]")))
+                fields  = set(f.lower() for f in break_fields)
+                field_overlap = len(applies & fields) / max(len(applies | fields), 1)
+                score += field_overlap * 0.6
+            except Exception:
+                pass
+            # Fallback 2: keyword overlap with clause text
+            q_words = set(query.lower().split())
+            t_words = set(r["text"].lower().split())
+            kw_overlap = len(q_words & t_words) / max(len(q_words), 1)
+            score += kw_overlap * 0.4
+
+        r["relevance_score"] = round(score, 3)
+        try:
+            r["applies_to"] = json.loads(r.get("applies_to", "[]"))
+        except Exception:
+            r["applies_to"] = []
+        r.pop("embedding", None)
+        scored.append(r)
+
+    scored.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return [r for r in scored[:top_k] if r["relevance_score"] > 0.05]
+
+
+def get_all_contracts() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, doc_name, section, category, applies_to, created_at FROM contract_library ORDER BY id"
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["applies_to"] = json.loads(d["applies_to"])
+        except Exception:
+            pass
+        result.append(d)
+    return result

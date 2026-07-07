@@ -27,7 +27,7 @@ def store_run_results(run_id: str, results: dict):
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     trimmed = {k: v for k, v in results.items() if k != "records"}
-    trimmed["records"] = results.get("records", [])[:500]  # cap at 500 to keep DB lean
+    trimmed["records"] = results.get("records", [])[:5000]  # cap at 5000 for full audit traceability
     with _results_conn() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO reconciliation_results (run_id, results_json, saved_at) VALUES (?, ?, ?)",
@@ -229,15 +229,26 @@ def _compare_values(val_a: Any, val_b: Any, match_type: str, threshold: Any) -> 
 
             return _normalize(str(val_a)) == _normalize(str(val_b))
 
-        elif match_type == "levenshtein":
+        elif match_type in ("levenshtein", "fuzzy", "jaro_winkler", "similarity"):
             from difflib import SequenceMatcher
-            ratio = SequenceMatcher(None, str(val_a), str(val_b)).ratio()
+            ratio = SequenceMatcher(None, str(val_a).lower(), str(val_b).lower()).ratio()
             return ratio >= (float(threshold) if threshold else 0.8)
+
+        elif match_type in ("numeric_tolerance", "tolerance", "numeric"):
+            def _to_float(v):
+                return float(str(v).replace(",", "").replace("$", "").strip())
+            a = _to_float(val_a)
+            b = _to_float(val_b)
+            tol = float(threshold) if threshold else 0.01
+            return abs(a - b) <= tol + 1e-9
 
         elif match_type == "date_tolerance":
             import pandas as pd
-            da = pd.to_datetime(val_a)
-            db = pd.to_datetime(val_b)
+            da = pd.to_datetime(val_a, errors="coerce")
+            db = pd.to_datetime(val_b, errors="coerce")
+            if pd.isna(da) or pd.isna(db):
+                # Not parseable as dates — fall back to normalised string comparison
+                return str(val_a).strip().lower() == str(val_b).strip().lower()
             delta = abs((da - db).days)
             return delta <= (int(threshold) if threshold else 0)
 
