@@ -92,9 +92,11 @@ def _profile_single(df: pd.DataFrame, label: str) -> list[dict]:
         str_vals = non_null.astype(str).str.strip()
 
         # ── Duplicate key check ─────────────────────────────────────────────
-        key_hints = {"id", "ref", "key", "trade", "account", "order", "number", "num",
-                     "reference", "transaction", "trxn", "isin", "cusip", "uetr"}
-        if any(kh in col.lower() for kh in key_hints):
+        key_hints = {"_id", "ref", "key", "account", "order", "number", "num",
+                     "reference", "transaction", "trxn", "isin", "cusip", "uetr",
+                     "trade_id", "tradeid", "trade_ref", "traderef"}
+        col_lower = col.lower().replace(" ", "_")
+        if any(kh in col_lower for kh in key_hints):
             dup = non_null.duplicated().sum()
             if dup > 0:
                 issues.append(_issue("error", "Duplicate Keys",
@@ -424,15 +426,16 @@ def score_field_match(val_a: Any, val_b: Any, match_type: str, threshold: Any = 
                 return 0.85 + 0.15 * (1 - diff / tol)
             return max(0.0, 0.85 - (diff - tol) / (tol + 1e-9) * 0.5)
 
-        if match_type == "levenshtein":
+        if match_type in ("levenshtein", "fuzzy", "jaro_winkler", "similarity"):
             from difflib import SequenceMatcher
             ratio = SequenceMatcher(None, a.lower(), b.lower()).ratio()
-            min_ratio = float(threshold) if threshold else 0.8
+            min_ratio = float(threshold) if isinstance(threshold, (int, float)) else 0.7
             if ratio >= 1.0:
                 return 1.0
             if ratio >= min_ratio:
                 return 0.60 + 0.35 * ((ratio - min_ratio) / (1.0 - min_ratio + 1e-9))
-            return 0.0
+            # Partial match — still give partial credit not 0
+            return max(0.0, ratio * 0.5)
 
         if match_type == "value_lookup":
             lookup: dict = threshold if isinstance(threshold, dict) else {}
