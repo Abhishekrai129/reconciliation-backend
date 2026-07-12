@@ -92,8 +92,9 @@ def _profile_single(df: pd.DataFrame, label: str) -> list[dict]:
         str_vals = non_null.astype(str).str.strip()
 
         # ── Duplicate key check ─────────────────────────────────────────────
+        # isin/cusip are securities codes (repeat across many trades) — not trade-level unique keys
         key_hints = {"_id", "ref", "key", "account", "order", "number", "num",
-                     "reference", "transaction", "trxn", "isin", "cusip", "uetr",
+                     "reference", "transaction", "trxn", "uetr",
                      "trade_id", "tradeid", "trade_ref", "traderef"}
         col_lower = col.lower().replace(" ", "_")
         if any(kh in col_lower for kh in key_hints):
