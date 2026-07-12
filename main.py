@@ -1183,7 +1183,12 @@ def regulatory_report(run_id: str):
             "rules": rules_step.get("ai_reasoning", ""),
         },
         "compliance": {
-            "hitl_review_performed": len(human_decisions) > 0,
+            # True if either a human_action was recorded OR the review step completed
+            "hitl_review_performed": len(human_decisions) > 0 or any(
+                s.get("step_name") in ("review", "human_review")
+                and s.get("status") == "done"
+                for s in trace.get("steps", [])
+            ),
             "full_audit_trail": True,
             "data_lineage_tracked": True,
             "break_explanations_available": True,
