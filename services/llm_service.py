@@ -305,6 +305,7 @@ CRITICAL RULES:
 2. "target_column" MUST be the exact name from FILE B (the first part before the parenthesis)
 3. Do NOT use the inferred label — use the raw name exactly as shown
 4. match_type: "value_lookup" when the Side/Dr-Cr field needs B→Buy normalisation
+   OR when Counterparty/cpty has full names (Goldman Sachs) vs codes (GS, MS, JPM)
 
 Respond ONLY with valid JSON:
 {{
@@ -548,15 +549,24 @@ Be specific about the actual values."""
 
 # ── Rule suggestion ───────────────────────────────────────────────────────────
 
+_COUNTERPARTY_LOOKUP = {
+    "Goldman Sachs": "GS", "Morgan Stanley": "MS", "JP Morgan": "JPM",
+    "JPMorgan": "JPM", "J.P. Morgan": "JPM", "Citi": "C", "Citibank": "C",
+    "Citigroup": "C", "Bank of America": "BAC", "BofA": "BAC",
+    "Deutsche Bank": "DB", "Barclays": "BARC", "UBS": "UBS",
+    "Credit Suisse": "CS", "HSBC": "HSBC", "Nomura": "NOM",
+}
+
 _HEURISTIC_RULES = {
-    "side":       ("value_lookup", None,  {"B": "Buy", "S": "Sell", "D": "Debit", "C": "Credit"}),
-    "price":      ("numeric_tolerance", 0.01, None),
-    "numeric":    ("numeric_tolerance", 0.01, None),
-    "quantity":   ("numeric_tolerance", 1.0,  None),
-    "date":       ("date_tolerance",    0,    None),
-    "identifier": ("exact",             None, None),
-    "currency":   ("exact",             None, None),
-    "text":       ("fuzzy",             0.85, None),
+    "side":         ("value_lookup", None,  {"B": "Buy", "S": "Sell", "D": "Debit", "C": "Credit"}),
+    "counterparty": ("value_lookup", None,  _COUNTERPARTY_LOOKUP),
+    "price":        ("numeric_tolerance", 0.01, None),
+    "numeric":      ("numeric_tolerance", 0.01, None),
+    "quantity":     ("numeric_tolerance", 1.0,  None),
+    "date":         ("date_tolerance",    0,    None),
+    "identifier":   ("exact",             None, None),
+    "currency":     ("exact",             None, None),
+    "text":         ("fuzzy",             0.85, None),
 }
 
 
@@ -599,7 +609,12 @@ Sample data (first 5 rows each side):
 For each mapping, choose:
 - match_type: exact | fuzzy | numeric_tolerance | date_tolerance | value_lookup
 - threshold: null for exact, 0-1 for fuzzy similarity, numeric for tolerance, OR a dict for value_lookup
-- For value_lookup fields (Side, Dr/Cr) use the value_map from the dictionary above
+- For Side/Dr-Cr fields use value_lookup with value_map from the dictionary above
+- For Counterparty/cpty/broker fields: if one side has full names (Goldman Sachs, Morgan Stanley)
+  and the other has broker codes (GS, MS, JPM), use value_lookup with threshold dict mapping
+  full name → code e.g. {{"Goldman Sachs": "GS", "Morgan Stanley": "MS", "JP Morgan": "JPM",
+  "Citi": "C", "Bank of America": "BAC", "Deutsche Bank": "DB", "Barclays": "BARC"}}
+- Never use exact match when sample values show full-name vs abbreviation patterns
 
 IMPORTANT: "source_column" and "target_column" must exactly match the mapping input values.
 
