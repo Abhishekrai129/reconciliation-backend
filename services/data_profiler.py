@@ -233,11 +233,11 @@ def _profile_cross(
     if only_a:
         issues.append(_issue("info", "Schema Drift",
                              f"{len(only_a)} column(s) only in source file",
-                             ", ".join(only_a[:6])))
+                             ", ".join(only_a)))
     if only_b:
         issues.append(_issue("info", "Schema Drift",
                              f"{len(only_b)} column(s) only in target file",
-                             ", ".join(only_b[:6])))
+                             ", ".join(only_b)))
 
     # ── Numeric scale mismatch ─────────────────────────────────────────────
     num_a = df_a.select_dtypes(include="number")
