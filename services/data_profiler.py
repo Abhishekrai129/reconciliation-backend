@@ -280,10 +280,17 @@ def _profile_cross(
 
 # ── Overall quality score & HITL triggers ─────────────────────────────────────
 
-def _quality_score(issues: list[dict]) -> int:
-    deductions = {"error": 20, "warning": 8, "info": 2}
-    score = 100 - sum(deductions.get(i["severity"], 0) for i in issues)
-    return max(0, min(100, score))
+def _quality_score(issues: list[dict], avg_mapping_confidence: float = 0.0) -> int:
+    # Schema Drift is expected in cross-system reconciliation (OMS vs broker FIX feed
+    # will never share column names). Info items are observations, not quality problems —
+    # deducting for them penalises normal data. Only errors and warnings cost points.
+    deductions = {"error": 20, "warning": 8, "info": 0}
+    base = 100 - sum(deductions.get(i["severity"], 0) for i in issues)
+    # Bonus: average semantic similarity across AI-mapped field pairs (0–10 pts).
+    # High-confidence mapping (e.g. 0.90 avg) → full +10. No mappings → 0.
+    if avg_mapping_confidence > 0:
+        base += round(avg_mapping_confidence * 10)
+    return max(0, min(100, base))
 
 
 def _hitl_triggers(issues: list[dict], quality_score: int) -> list[str]:
